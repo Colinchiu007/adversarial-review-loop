@@ -1,0 +1,12 @@
+{
+  "id": "fix-review-round2-criticals",
+  "title": "修复第二轮双模型对抗评审发现的5个Critical问题",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档",
+  "createdAt": "2026-09-01T00:00:00+08:00",
+  "branch": "main"
+}
