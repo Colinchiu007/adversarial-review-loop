@@ -1,0 +1,43 @@
+﻿{
+  "schemaVersion": 1,
+  "proposer": "opencode",
+  "critic": "claude",
+  "objectType": "plan",
+  "maxRounds": 3,
+  "scoreThreshold": 8.0,
+  "dimensions": [
+    { "key": "completeness", "label": "完整性" },
+    { "key": "consistency", "label": "一致性" },
+    { "key": "clarity", "label": "清晰度" },
+    { "key": "feasibility", "label": "可行性" },
+    { "key": "security", "label": "安全性" }
+  ],
+  "stallScoreDelta": 0.5,
+  "stallRounds": 2,
+  "maxL3RejectionsPerRound": 3,
+  "retryCount": 2,
+  "timeoutMs": 120000,
+  "autoAcceptOnStall": false,
+  "escalationTTL": 86400,
+  "maxTokensPerTask": 200000,
+  "familyMapFile": "references/family-check.md",
+  "modelCall": {
+    "wrapper": "C:/Users/邱领/.claude/bin/codeagent-wrapper.exe",
+    "backend": { "opencode": "opencode", "claude": "claude" },
+    "lite": true
+  },
+  "objectTypes": {
+    "plan": {
+      "dimensions": ["completeness","consistency","clarity","feasibility","security"],
+      "templates": { "proposal": "templates/proposal.md", "critique": "templates/critique.md", "rebuttal": "templates/rebuttal.md", "summary": "templates/summary.md" }
+    },
+    "test": {
+      "dimensions": ["coverage","assertionQuality","edgeCases"],
+      "templates": { "proposal": "templates/proposal.md", "critique": "templates/critique.md", "rebuttal": "templates/rebuttal.md", "summary": "templates/summary.md" }
+    },
+    "code": {
+      "dimensions": ["correctness","security","performance"],
+      "templates": { "proposal": "templates/proposal.md", "critique": "templates/critique.md", "rebuttal": "templates/rebuttal.md", "summary": "templates/summary.md" }
+    }
+  }
+}
