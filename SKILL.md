@@ -58,9 +58,11 @@ type: workflow
 ```
 <project>/.adversarial/{task-slug}/
 ├── task.json                 # 任务元数据（状态、配置、轮次）
+├── family-snapshot.json      # 家族映射快照（保证历史可复现）
+├── .lock                     # 跨进程文件锁
 ├── proposal-v1.md            # 方案 v1
-├── critique-v1.md            # 评审 v1（逐条打分）
-├── rebuttal-v1.md            # 回应 v1（接受/拒绝+证据）
+├── critique-v1.md            # 评审 v1（逐条打分，纯 JSON）
+├── rebuttal-v1.md            # 回应 v1（接受/拒绝+证据，纯 JSON）
 ├── proposal-v2.md            # 方案 v2（带反馈修订）
 ├── critique-v2.md
 ├── rebuttal-v2.md

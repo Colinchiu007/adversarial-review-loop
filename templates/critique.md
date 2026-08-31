@@ -1,17 +1,12 @@
 ﻿# Critique — 对抗评审
 
-> 评审方产出。逐条挑刺 + 维度评分。采用结构化输出（JSON schema），解析层校验。
+> 评审方产出。逐条挑刺 + 维度评分。
+> **输出格式：纯 JSON 文件（非 Markdown）。** 引擎解析层只接受 JSON，解析失败会触发重试。
+> 以下是 JSON schema 契约——评审方 LLM 应严格按此结构输出。
 
-## 元信息
+## 输出格式契约（JSON，非 Markdown）
 
-- 任务: {task-slug}
-- 版本: v{N}
-- 评审方: {critic}
-- 日期: {date}
-- 评审对象: proposal-v{N}.md
-- 独立声明: `<!-- context: proposal-v{N}.md, requirements.md, ... -->`（记录评审方看到的上下文，便于审计独立性）
-
-## 结构化输出（JSON schema）
+critique-v{N}.md 文件**实际内容为纯 JSON**（文件扩展名保留 `.md` 便于人类浏览，但内容为 JSON）：
 
 ```json
 {
@@ -29,7 +24,7 @@
     {
       "id": 1,
       "target": "proposal §3.2",
-      "severity": "Critical | Warning | Info",
+      "severity": "Critical",
       "dimension": "completeness",
       "finding": "缺少 watchdog 脚本的告警机制说明",
       "suggestion": "补充告警方式与重试策略"
@@ -41,13 +36,19 @@
 }
 ```
 
-### severity 枚举白名单
+### 格式规则
 
-`Critical` / `Warning` / `Info`（大小写敏感，解析层校验）
+- **文件内容为纯 JSON**，不要包裹 Markdown 代码块（```` ```json ````），不要在 JSON 前后加任何文字。
+- 引擎解析层直接 `JSON.parse()` 文件内容，解析失败时重试（retryCount 次）。
+- 解析失败时，引擎会向评审方 LLM 追加错误信息并要求重新输出 JSON。
 
-### dimension 枚举白名单
+### severity 枚举白名单（JSON 值必须精确匹配）
 
-`completeness` / `consistency` / `clarity` / `feasibility` / `security`（按 config.dimensions 配置）
+`"Critical"` / `"Warning"` / `"Info"`（大小写敏感，解析层校验，不匹配则拒绝）
+
+### dimension 枚举白名单（JSON key 必须与 config.dimensions 一致）
+
+`"completeness"` / `"consistency"` / `"clarity"` / `"feasibility"` / `"security"`（按 config.dimensions 配置，不匹配则拒绝）
 
 ## 撤回意见段落
 

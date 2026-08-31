@@ -18,12 +18,34 @@
 - **拉锯检测**：出方案方连续 2 轮用相同的证据（任意等级）拒绝同一批问题，评审方不接受也不放弃 → 升级到人。
 - **评审变严格导致的分数短期下降不是 stall**，要看趋势而非单轮绝对值。
 
+## 部分接受计数规则（R2-C2 修复）
+
+`partially_accepted` 是独立第三态，不归入 accepted 也不归入 rejected：
+
+- **对 criticalRemaining 的影响**：未接受部分仍计入 criticalRemaining（除非评审在下一轮撤回）。
+- **对 converged 判定的影响**：部分接受的问题在 criticalRemaining 中保留，阻止误判收敛。
+- **对 stall 检测的影响**：部分接受且剩余部分未变更 → 视为问题未收敛，计入 stall 信号。
+- 部分接受的 issue 在 summary.md 中列为"部分接受（未完成）"。
+
 ## L3 配额机制（防万能逃逸）
 
 - 每轮 L3 拒绝设上限（config.maxL3RejectionsPerRound，默认 3）。
-- **配额按问题维度追踪**（同一问题累计 L3 次数），而非每轮全局计数（防换编号绕过）。
+- **配额按问题指纹追踪**（R2-C3 修复，见下），而非每轮全局计数或 issueId。
 - 超过上限的 L3 拒绝自动降级为 Critical 未解决，计入 criticalRemaining。
 - L3 拒绝的问题标记为 deferred，在 summary.md 单独追踪，确保不被无声吞没。
+
+### 问题指纹机制（防换编号绕过）
+
+L3 配额计数基于**问题指纹**，而非 issueId。指纹计算规则：
+
+```
+fingerprint = SHA256(finding + target + dimension).substring(0, 16)
+```
+
+- 换 issueId 但 finding/target/dimension 相同 → 指纹相同 → 配额累计。
+- 不同轮次间同一问题指纹一致 → 跨轮 L3 拒绝对同一问题累计。
+- 枚举在 rebuttal-vN.md 的每个 L3 拒绝条目中记录 `fingerprint` 字段。
+- 引擎在累计 L3 配额时按 fingerprint 去重，而非按 issueId。
 
 ## 评分噪声处理
 

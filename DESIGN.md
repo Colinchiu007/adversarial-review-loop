@@ -151,9 +151,11 @@ adversarial-review-loop/
 <project>/.adversarial/{
   {task-slug}/
 ├── task.json                 # 任务元数据（状态、配置、轮次）
+├── family-snapshot.json      # 家族映射快照（R2-C5，保证历史可复现）
+├── .lock                     # 跨进程文件锁（R2-C4）
 ├── proposal-v1.md            # 方案 v1
-├── critique-v1.md            # 评审 v1（逐条打分）
-├── rebuttal-v1.md            # 回应 v1（接受/拒绝+证据）
+├── critique-v1.md            # 评审 v1（逐条打分，纯 JSON）
+├── rebuttal-v1.md            # 回应 v1（接受/拒绝+证据，纯 JSON）
 ├── proposal-v2.md            # 方案 v2（带反馈修订）
 ├── critique-v2.md
 ├── rebuttal-v2.md
@@ -212,44 +214,69 @@ adversarial-review-loop/
 
 > **C2 修复：结构化输出**。critique/rebuttal 采用严格结构化输出（JSON schema，severity 枚举白名单 Critical/Warning/Info，维度枚举白名单），解析层加校验+失败重试，避免 LLM 枚举值不稳定导致统计失真。
 >
+> **R2-C1 修复：输出格式为纯 JSON**。文件内容为纯 JSON（非 Markdown），解析层直接 `JSON.parse()`。扩展名保留 `.md` 便于人类浏览。
+>
 > **W11 修复：无证据拒绝**。拒绝必须附证据（L1/L2/L3），无证据拒绝为禁止行为——若出现则自动降级为 Critical 未解决并计入 rejectedWithoutEvidence 统计（用于审计违规）。
 
-``````markdown
-## 意见 #1
-- 对象: 方案 §3.2 节
-- 严重级: Critical / Warning / Info
-- 维度: 完整性
-- 意见: 缺少 watchdog 脚本的告警机制说明
-- 建议: 补充告警方式与重试策略
-
-## 意见 #2
-...
-（每轮末尾）
-## 维度评分
-| 维度 | 得分 |
-|---|---|
-| 完整性 | 7.5 |
-| 一致性 | 6.0 |
+``````json
+{
+  "schemaVersion": 1,
+  "round": 1,
+  "critic": "claude",
+  "dimensionScores": {
+    "completeness": 7.5,
+    "consistency": 6.0
+  },
+  "issues": [
+    {
+      "id": 1,
+      "target": "proposal §3.2",
+      "severity": "Critical",
+      "dimension": "completeness",
+      "finding": "缺少 watchdog 脚本的告警机制说明",
+      "suggestion": "补充告警方式与重试策略"
+    }
+  ],
+  "retracted": [
+    { "issueId": 2, "reason": "上一轮意见 #2 撤回，出方案方 L1 证据成立" }
+  ]
+}
 ``````
 
 ### 4.4 rebuttal-vN.md（出方案方逐条回应，证据分级落点）
 
-``````markdown
-## 回应 #1（对应意见 #1）
-- 决定: 接受
-- 修改: 已补充告警机制说明到 §3.2
+> **R2-C1 修复：输出格式为纯 JSON**。同 critique，文件内容为纯 JSON。
+> **R2-C3 修复：fingerprint 字段**。每条 L3 拒绝附带 fingerprint（SHA256(finding+target+dimension) 前 16 位），引擎按 fingerprint 去重累计配额。
 
-## 回应 #2（对应意见 #2）
-- 决定: 拒绝
-- 证据等级: L1 反例
-- 证据: 该正则已通过 47 个边界测试，实际结果与 A 写法等价但性能更好（附测试链接）
-- 说服目标: 请评审方在下一轮复核
-
-## 回应 #3
-- 决定: 部分接受
-- 证据等级: L3 权衡
-- 说明: 承认此问题，但当前为权衡选择（换取 X），建议下一阶段处理
-- 说服目标: 请评审方判断该权衡是否可接受
+``````json
+{
+  "schemaVersion": 1,
+  "round": 1,
+  "proposer": "opencode",
+  "responses": [
+    {
+      "issueId": 1,
+      "decision": "accepted",
+      "modification": "已补充告警机制说明到 §3.2"
+    },
+    {
+      "issueId": 2,
+      "decision": "rejected",
+      "evidenceLevel": "L1",
+      "evidence": "该正则已通过 47 个边界测试，实际结果与 A 写法等价但性能更好",
+      "fingerprint": "a1b2c3d4e5f6g7h8",
+      "persuade": "请评审方在下一轮复核"
+    },
+    {
+      "issueId": 3,
+      "decision": "partially_accepted",
+      "evidenceLevel": "L3",
+      "evidence": "承认此问题，但当前为权衡选择（换取 X），建议下一阶段处理",
+      "fingerprint": "i9j0k1l2m3n4o5p6",
+      "persuade": "请评审方判断该权衡是否可接受"
+    }
+  ]
+}
 ``````
 
 ## 5. 技术实现

@@ -28,8 +28,10 @@ initialized → in_progress → converged | escalated | auto_accepted | error | 
 1. 读取配置（proposer/critic/maxRounds/scoreThreshold/dimensions/...）
 2. 家族校验：intersection(familyMap[proposer], familyMap[critic]).isEmpty()
 3. 创建 .adversarial/{task-slug}/ 目录
-4. 初始化 task.json（status=in_progress, currentRound=0）
-5. 记录 resolvedFamily（运行时解析的家族快照）
+4. 获取跨进程锁（.lock 文件），防止并发写冲突
+5. 写入 family-snapshot.json（完整家族映射表快照，保证历史可复现）
+6. 初始化 task.json（status=in_progress, currentRound=0）
+7. 记录 resolvedFamily（运行时解析的家族快照，基于 family-snapshot.json）
 ```
 
 ### 2. 出方案（Proposal）
@@ -86,7 +88,7 @@ initialized → in_progress → converged | escalated | auto_accepted | error | 
 
 - task.json 作为**单一写入口**，写前读后校验状态机。
 - 产物采用**临时文件 + 原子 rename** 落盘。
-NaN
+- **跨进程锁**：所有写操作前获取 `.lock` 文件锁（详见 references/pairing.md）。
 - 支持 **resume**：从最后一个完整轮次续跑（凭 task.json 的 currentRound）。
 - 孤儿产物（有文件但 task.json 无记录）清理规则：保留，标注 orphan。
 

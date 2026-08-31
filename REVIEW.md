@@ -39,6 +39,16 @@
 - git 交互/多任务依赖未定义（opencode W-D）
 - 对抗强度无校准（opencode W-E）
 
+## 修复记录（2026-09-01）
+
+| # | 问题 | 修复文件 | 修复内容 |
+|---|---|---|---|
+| R2-C1 | 结构化输出声明与模板格式自相矛盾 | critique.md, rebuttal.md | 明确输出为纯 JSON 文件，禁止包裹 Markdown 代码块，解析层直接 JSON.parse() |
+| R2-C2 | "部分接受"在收敛计数体系中无归属 | convergence.md | 新增"部分接受计数规则"章节，显式定义 partially_accepted 对 criticalRemaining/converged/stall 的影响 |
+| R2-C3 | L3 配额可被换编号绕过 | convergence.md, rebuttal.md | 新增"问题指纹机制"（SHA256(finding+target+dimension)），配额按 fingerprint 去重累计，rebuttal JSON 增加 fingerprint 字段 |
+| R2-C4 | 原子 rename 无跨进程锁 | pairing.md, review-loop.md | 新增"跨进程锁机制"（.lock 文件 + O_CREAT\|O_EXCL + pid 探测死锁），初始化流程增加锁获取步骤 |
+| R2-C5 | 家族动态切换使历史不可复现 | family-check.md, pairing.md | 新增 family-snapshot.json 落盘（完整家族映射表快照），历史任务重跑优先使用快照 |
+
 ## 结论
 
-两轮双模型对抗评审充分验证了设计。核心机制（对抗回应闭环、证据分级、双轨评分、L3 配额）扎实，但引擎骨架仍需落地为可执行规范（workflows/review-loop.md + 模板 + task.json schema），并用最小用例端到端验证。建议下一步进入实施规划。
+两轮双模型对抗评审充分验证了设计。核心机制（对抗回应闭环、证据分级、双轨评分、L3 配额）扎实，5 个第二轮 Critical 已全部修复。建议下一步进入双模型审查验证修复质量。
