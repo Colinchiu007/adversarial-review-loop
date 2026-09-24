@@ -1,4 +1,4 @@
-﻿---
+---
 name: adversarial-review-loop
 description: "跨家族模型对抗评审循环引擎——出方案→逐条挑刺打分→逐条回应（可拒绝但须给证据）→多轮收敛→产物配对落盘。用于规划/方案/代码/测试的对抗性审查。"
 type: workflow
