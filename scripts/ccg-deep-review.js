@@ -67,6 +67,7 @@ function arg(name, dflt) {
 const SHA = arg("--sha", "");
 const BASE = arg("--base", "origin/main");
 const PROPOSAL = arg("--proposal", ""); // 决策层：评审方案文档；缺省则评审 diff（验证层）
+const ALLOW_WHOLE_COMMIT = process.argv.includes("--allow-whole-commit");
 const DRY_RUN = process.argv.includes("--dry-run");
 const REPO = process.cwd();
 
@@ -141,8 +142,13 @@ function resolveBases(sha) {
 }
 
 // ---------- 生成 proposal（把 diff 变成评审对象）----------
+// 返回 { text, baseUsed, mode }。
+// ⚠️ mode 必须在输出里如实报告：'diff' 是预期路径，
+//    'whole-commit' 意味着取不到 diff、只能评审整个 commit——
+//    这个体量可能是预期的十几倍，耗时与 token 都会失控。
+//    实测踩过：单 commit 仓里 HEAD~1 不存在 → 静默回退到整 commit 评审，
+//    31 KB 的"评审对象"就这么来了。绝不静默降级。
 function buildProposal(sha) {
-  let diff = "";
   const bases = resolveBases(sha);
   for (const b of bases) {
     try {
@@ -150,32 +156,52 @@ function buildProposal(sha) {
         encoding: "utf8",
         maxBuffer: 32 * 1024 * 1024,
       });
-      if (d && d.trim()) { diff = d; break; }
+      if (d && d.trim()) {
+        return { text: wrapProposal(sha, b, d, "diff"), baseUsed: b, mode: "diff" };
+      }
     } catch (_) { /* 试下一个基线 */ }
   }
-  if (!diff.trim()) {
+
+  // 没有可用 diff：只有显式要求时才退回整 commit
+  if (ALLOW_WHOLE_COMMIT) {
     try {
-      diff = execFileSync("git", ["show", sha], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
-    } catch (_) {
-      diff = "";
-    }
+      const show = execFileSync("git", ["show", sha], {
+        encoding: "utf8",
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      if (show && show.trim()) {
+        return {
+          text: wrapProposal(sha, "(whole commit)", show, "whole-commit"),
+          baseUsed: "(whole commit)",
+          mode: "whole-commit",
+        };
+      }
+    } catch (_) { /* 忽略 */ }
   }
-  if (!diff.trim()) return null;
-  const usedBase = bases[0] || BASE;
+  return null;
+}
+
+function wrapProposal(sha, base, body, mode) {
+  const warn =
+    mode === "whole-commit"
+      ? `\n> ⚠️ **取不到 base..head 的 diff，本文件是整个 commit 的内容。**\n` +
+        `> 评审体量可能远超预期，耗时与 token 都会相应放大。\n`
+      : "";
   return [
     `# 变更提案（自动生成，待对抗评审）`,
     ``,
-    `- base: \`${usedBase}\``,
+    `- base: \`${base}\``,
     `- head: \`${sha}\``,
-    `- 变更规模: ${diff.split("\n").length} 行 diff`,
-    ``,
+    `- 采集模式: \`${mode}\``,
+    `- 变更规模: ${body.split("\n").length} 行`,
+    warn,
     `## 变更内容`,
     ``,
     "```diff",
-    diff,
+    body,
     "```",
     ``,
-    `> 这是机械生成的变更提案，不代表任何设计意图。评审方请只针对上述 diff 挑刺。`,
+    `> 这是机械生成的变更提案，不代表任何设计意图。评审方请只针对上述内容挑刺。`,
   ].join("\n");
 }
 
@@ -497,11 +523,19 @@ function main() {
     familyMap: FAMILY_MAP,
   });
 
-  const proposal = buildProposal(sha);
-  if (!proposal) {
-    console.log("⏭ 取不到 diff（可能 base 与 head 相同）—— 退出 0");
+  const built = buildProposal(sha);
+  if (!built) {
+    console.log("⏭ 取不到 diff（base..head 为空且未加 --allow-whole-commit）—— 退出 0");
+    console.log("   如确实要评审整个 commit，加 --allow-whole-commit");
     return 0;
   }
+  if (built.mode === "whole-commit") {
+    console.log(`⚠️ 取不到 base..head 的 diff，已回退为整 commit 评审（base=${built.baseUsed}）`);
+    console.log(`   评审体量可能远超预期；如需该行为请显式加 --allow-whole-commit`);
+  } else {
+    console.log(`变更基线: ${built.baseUsed}（${built.text.split("\n").length} 行）`);
+  }
+  const proposal = built.text;
   engine.writeArtifact(dir, "proposal-v1.md", proposal);
 
   // 跑第一轮：评审方挑刺
@@ -528,11 +562,26 @@ function main() {
   }
 
   if (!cr || !cr.ok) {
-    const why = (cr && (cr.error || (cr.validationErrors && JSON.stringify(cr.validationErrors)))) || "未知原因";
-    console.error("评审失败: " + why);
+    // 与决策层一致的诊断输出：校验明细 + 模型原始返回片段。
+    // 此前验证层只有一句「Critique校验失败」，无法定位——踩过。
+    console.error("评审失败: " + ((cr && cr.error) || "未知原因"));
+    if (cr && cr.validationErrors && cr.validationErrors.length) {
+      console.error("  校验错误:");
+      cr.validationErrors.slice(0, 8).forEach(function (e) { console.error("    - " + e); });
+    }
+    if (cr && cr.raw) {
+      console.error("  解析出的 JSON 片段:");
+      console.error("    " + String(cr.raw).slice(0, 400).replace(/\n/g, "\n    "));
+    } else if (cr && cr.rawOutput) {
+      console.error("  模型原始返回（前 400 字符）:");
+      console.error("    " + String(cr.rawOutput).slice(0, 400).replace(/\n/g, "\n    "));
+    }
     writeBack(sha, {
       required: true, status: "error", performedBy: cfg.critic,
-      findings: null, error: String(why), at: new Date().toISOString(),
+      findings: null,
+      error: String((cr && cr.error) || "未知原因"),
+      validationErrors: (cr && cr.validationErrors) || null,
+      at: new Date().toISOString(),
     });
     return 2;
   }
