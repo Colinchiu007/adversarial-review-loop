@@ -55,7 +55,11 @@ function scenarioH() {
   var ok2 = true;
   try { e.validateTransition('in_progress', 'converged'); } catch (err) { ok2 = false; }
   check('H2 in_progress->converged 合法迁移通过', ok2 === true);
-  check('H3 合法状态集合', e.VALID_STATES.length === 7 && e.VALID_STATES.indexOf('archived') >= 0);
+  check('H3 合法状态集合', e.VALID_STATES.length === 8 && e.VALID_STATES.indexOf('archived') >= 0);
+  check('H3b self_play 状态已注册', e.VALID_STATES.indexOf('self_play') >= 0);
+  var okSp = true;
+  try { e.validateTransition('in_progress', 'self_play'); } catch (err) { okSp = false; }
+  check('H3c in_progress->self_play 合法迁移', okSp === true);
   // 终态不可再迁出
   var ok3 = true;
   try { e.validateTransition('archived', 'in_progress'); } catch (err) { ok3 = false; }

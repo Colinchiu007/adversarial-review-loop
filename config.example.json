@@ -36,8 +36,19 @@
       "templates": { "proposal": "templates/proposal.md", "critique": "templates/critique.md", "rebuttal": "templates/rebuttal.md", "summary": "templates/summary.md" }
     },
     "code": {
-      "dimensions": ["correctness","security","performance"],
+      "dimensions": ["correctness","security","performance","maintainability"],
+      "maintainabilityNote": "承接质量节拍 QM-2 代码必检项，让深度审查与流程门禁覆盖面接得上",
+      "maxRounds": 2,
+      "timeoutMs": 600000,
+      "timeoutNote": "实测单次真实代码审查可超 10 分钟，plan 的 120s 不适用于 code",
       "templates": { "proposal": "templates/proposal.md", "critique": "templates/critique.md", "rebuttal": "templates/rebuttal.md", "summary": "templates/summary.md" }
     }
+  },
+  "selfPlay": {
+    "enabled": true,
+    "confidenceWeight": 0.6,
+    "_note": "stall/maxRounds 后的第三档出口：当前 LLM 扮演对抗双方裁决，替代直接升级给人。高危域(auth/加密/数据库迁移)不允许自扮演豁免。",
+    "highRiskDomains": ["auth", "crypto", "datamigration"],
+    "outputFile": "adjudication.json"
   }
 }
