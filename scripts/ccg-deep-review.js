@@ -66,6 +66,7 @@ function arg(name, dflt) {
 }
 const SHA = arg("--sha", "");
 const BASE = arg("--base", "origin/main");
+const PROPOSAL = arg("--proposal", ""); // 决策层：评审方案文档；缺省则评审 diff（验证层）
 const DRY_RUN = process.argv.includes("--dry-run");
 const REPO = process.cwd();
 
@@ -227,6 +228,129 @@ function writeBack(sha, deepReview) {
   fs.writeFileSync(f, JSON.stringify(rec, null, 2) + "\n", "utf8");
 }
 
+// ---------- 决策层：方案对抗评审（动手写码之前）----------
+// 这是 adversarial-review-loop 引擎的主流程：出方案 → 跨家族挑刺 → 逐条回应
+// → 多轮收敛 → 才动手。评审对象是方案文档，不是 diff。
+function runDecisionLayer(sha, proposalFile) {
+  const abs = path.resolve(proposalFile);
+  if (!fs.existsSync(abs)) {
+    console.error("找不到方案文件: " + abs);
+    return 2;
+  }
+  const mode = (arg("--mode", "") || "dual").toLowerCase();
+  const text = fs.readFileSync(abs, "utf8");
+
+  console.log(`\n═══ 决策层：方案对抗评审 ═══`);
+  console.log(`方案: ${proposalFile}`);
+  console.log(`判定: ${mode.toUpperCase()}  (由 plan-review.sh 的判定器给出)`);
+
+  if (mode === "skip") {
+    console.log("S 复杂度低风险，跳过跨家族对抗评审 —— 可直接进入实施");
+    return 0;
+  }
+
+  const cfg = Object.assign(cfgForMode(mode), {
+    objectType: "plan",
+    dimensions: ["completeness", "consistency", "clarity", "feasibility", "security"],
+  });
+  const fam = engine.familyCheck(FAMILY_MAP, cfg.proposer, cfg.critic);
+  console.log(
+    fam.ok
+      ? `跨家族校验: proposer=${cfg.proposer}(${fam.resolved && fam.resolved.proposer}) critic=${cfg.critic}(${fam.resolved && fam.resolved.critic}) 通过`
+      : `跨家族校验未通过: ${fam.reason || "家族重叠"} —— 降级为单后端`
+  );
+
+  const base = path.basename(proposalFile).replace(/\.[^.]+$/, "").toLowerCase();
+  const slug = engine.validateSlug("ccg-plan-" + base)
+    ? "ccg-plan-" + base
+    : "ccg-plan-" + sha.slice(0, 8);
+  const dir = path.join(REPO, ".adversarial", slug);
+  fs.mkdirSync(dir, { recursive: true });
+
+  if (DRY_RUN) {
+    console.log(`[dry-run] 将创建 ${path.relative(REPO, dir)}`);
+    console.log(`[dry-run] 引擎配置: ${JSON.stringify({ objectType: cfg.objectType, maxRounds: cfg.maxRounds, dimensions: cfg.dimensions, selfPlay: cfg.selfPlay })}`);
+    return 0;
+  }
+
+  engine.atomicWriteJson(path.join(dir, "family-snapshot.json"), {
+    schemaVersion: 1,
+    snapshotCreatedAt: new Date().toISOString(),
+    layer: "decision",
+    resolvedFamily: fam.resolved || { proposer: cfg.proposer, critic: cfg.critic },
+    familyMap: FAMILY_MAP,
+  });
+
+  engine.writeArtifact(dir, "proposal-v1.md", text);
+  console.log(`\n[轮 1/${cfg.maxRounds}] 调用 critic=${cfg.critic} 对方案挑刺...`);
+
+  let cr;
+  try {
+    cr = mc.callCritic({
+      backend: cfg.critic,
+      workdir: REPO,
+      roundN: 1,
+      proposalText: text,
+      wrapperPath: mc.DEFAULT_WRAPPER,
+      timeoutMs: cfg.timeoutMs,
+      retryCount: cfg.retryCount,
+    });
+  } catch (err) {
+    console.error("评审调用异常: " + err.message);
+    return 2;
+  }
+  if (!cr || !cr.ok) {
+    console.error("评审失败: " + ((cr && cr.error) || "未知原因"));
+    return 2;
+  }
+
+  const critique = cr.data;
+  engine.writeArtifact(dir, "critique-v1.md", JSON.stringify(critique, null, 2));
+  const scores = (critique.scores || []).map(function (s) { return s.score; });
+  const minScore = scores.length ? Math.min.apply(null, scores) : null;
+  const critCount = (critique.issues || []).length;
+  const critCritical = (critique.issues || []).filter(function (i) { return i.severity === "Critical"; }).length;
+  console.log(`  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），最低维度分 ${minScore}`);
+
+  // 决策层的收敛判定：出方案方尚未回应，因此只可能"继续"或"升级给人"，
+  // 不存在"收敛"——收敛要等逐条回应之后。
+  var hasCritical = critCritical > 0;
+  var verdict, verdictWhy;
+  if (hasCritical) {
+    verdict = "blocked";
+    verdictWhy = `评审方提出 ${critCritical} 条 Critical，必须由出方案方逐条回应（可拒绝但须给证据）后才能动手`;
+  } else if (minScore !== null && minScore >= (cfg.scoreThreshold || 8.0)) {
+    verdict = "cleared";
+    verdictWhy = `无 Critical 且最低维度分 ${minScore} ≥ ${cfg.scoreThreshold}，方案可执行`;
+  } else {
+    verdict = "needs_revision";
+    verdictWhy = `无 Critical 但最低维度分 ${minScore} < ${cfg.scoreThreshold}，建议先补强再动手`;
+  }
+
+  console.log(`\n决策层裁决: ${verdict}`);
+  console.log(`  ${verdictWhy}`);
+  console.log(`  产物: ${path.relative(REPO, dir)}（proposal-v1 / critique-v1 已配对落盘）`);
+  if (verdict === "blocked") {
+    console.log("  → 需在方案里逐条回应 Critical 后重跑本脚本，收敛才可动手");
+  } else if (verdict === "needs_revision") {
+    console.log("  → 可动手，但建议按 critique 补强；补强后重跑会重新判定");
+  }
+
+  writeBack(sha, {
+    required: true,
+    layer: "decision",
+    status: verdict,
+    performedBy: cfg.critic,
+    objectType: "plan",
+    minScore: minScore,
+    findings: critique.issues || [],
+    note: verdictWhy,
+    artifacts: path.relative(REPO, dir),
+    at: new Date().toISOString(),
+  });
+  return verdict === "cleared" ? 0 : 1;
+}
+
 // ---------- main ----------
 function main() {
   const sha = SHA || currentSha();
@@ -235,6 +359,16 @@ function main() {
     return 2;
   }
 
+  // ══════════════════════════════════════════════════════════════
+  //  决策层：--proposal <方案文件>  —— 动手写码之前
+  // ══════════════════════════════════════════════════════════════
+  if (PROPOSAL) {
+    return runDecisionLayer(sha, PROPOSAL);
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  //  验证层：评审已落地的 diff —— 动手之后
+  // ══════════════════════════════════════════════════════════════
   const decision = readDecision(sha);
   if (!decision) {
     console.log("⏭ 未找到 .ccg/reviews/" + sha.slice(0, 8) + ".json —— 提交时未跑判定器，跳过深度审查");
