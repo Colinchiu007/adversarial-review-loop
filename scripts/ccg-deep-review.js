@@ -506,6 +506,27 @@ function runDecisionLayer(sha, proposalFile) {
     objectType: "plan",
     dimensions: ["completeness", "consistency", "clarity", "feasibility", "security"],
   });
+
+  // 后端可覆盖。
+  //
+  // 为什么需要：实测两个后端对「多段提示」的兼容性完全不同——
+  //   claude   收全整个 stdin（13KB 方案评审正常，修订环节也能收全）
+  //   opencode 只消费 stdin 的第一段，四种提示形状全部失败：
+  //     角色说明在前 → 只回角色；单句祈使 → 正常；
+  //     标题开头 → 只收标题行；祈使句开头 + <plan> → 仍然只收第一段
+  //   它还会读工作区并自行把方案读出来，但不能依赖（那是它碰巧知道路径）。
+  // 所以 proposer/critic 哪个能用，取决于方案大小与提示形状，不该写死。
+  const proposerOverride = arg("--proposer", "");
+  const criticOverride = arg("--critic", "");
+  if (proposerOverride) cfg.proposer = proposerOverride;
+  if (criticOverride) cfg.critic = criticOverride;
+  if (proposerOverride || criticOverride) {
+    console.log(`后端覆盖: proposer=${cfg.proposer} critic=${cfg.critic}`);
+    if (cfg.proposer === cfg.critic) {
+      console.log("   ⚠ proposer 与 critic 同为 " + cfg.proposer +
+        "，跨家族校验必然不通过——同族对拍会显著削弱独立性");
+    }
+  }
   const fam = engine.familyCheck(FAMILY_MAP, cfg.proposer, cfg.critic);
   console.log(
     fam.ok
@@ -530,6 +551,19 @@ function runDecisionLayer(sha, proposalFile) {
     console.log(`[dry-run] 将创建 ${path.relative(REPO, dir)}`);
     console.log(`[dry-run] 引擎配置: ${JSON.stringify({ objectType: cfg.objectType, maxRounds: maxRounds, roundsFrom: arg("--rounds", "") ? "--rounds" : "engine-default", proposer: cfg.proposer, critic: cfg.critic, dimensions: cfg.dimensions })}`);
     return 0;
+  }
+
+  // 开工前的长度预警：proposer 侧的输入是「角色提示 + 方案 + critique + schema」，
+  // 方案本身就得占掉大半。等第 1 轮 critic 跑完（2-4 分钟）才发现装不下，
+  // 那三分钟纯浪费。这里提前一句。
+  const proposerLimit = mc.backendInputLimit ? mc.backendInputLimit(cfg.proposer) : 0;
+  if (proposerLimit && text.length > proposerLimit) {
+    console.log(`\n⚠ 预检：方案 ${text.length} 字符，已超过 ${cfg.proposer} 后端单次输入上限 ${proposerLimit}`);
+    console.log(`   该后端会【静默拒绝】（~120ms、exit 1、无错误信息），` +
+      `proposer 修订环节必然失败。`);
+    console.log(`   critic 侧（${cfg.critic}）不受此限，第 1 轮评审仍会正常跑完。`);
+    console.log(`   建议：把方案拆到 ${proposerLimit} 字符以内，或删掉对评审无用的内容。`);
+    console.log(`   —— 继续跑（已知修订环节会失败），或 Ctrl-C 后先精简方案。`);
   }
 
   engine.atomicWriteJson(path.join(dir, "family-snapshot.json"), {
@@ -659,6 +693,13 @@ function runDecisionLayer(sha, proposalFile) {
     }
     if (!rv || !rv.ok) {
       console.error("修订失败: " + ((rv && rv.error) || "未知原因"));
+      if (rv && rv.inputTooLong) {
+        const b = rv.breakdown || {};
+        console.error(`  长度构成: 角色提示 ${b.rolePrompt} + 任务提示 ${b.taskPrompt} = ${b.total} 字符`);
+        console.error(`  ${cfg.proposer} 后端上限 ${rv.limit} 字符（实测值，非文档承诺）`);
+        console.error("  对策：把方案拆小后分轮评审，或去掉方案里对 reviewer 无用的内容");
+        console.error("       （如历史修订轨迹、意见对应表——那是给人看的，不是评审对象）");
+      }
       if (rv && rv.validationErrors && rv.validationErrors.length) {
         console.error("  校验错误:");
         rv.validationErrors.slice(0, 10).forEach(function (e) { console.error("    - " + e); });

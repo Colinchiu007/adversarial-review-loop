@@ -16,6 +16,33 @@ const DEFAULT_RETRY_COUNT = 2;
 const RETRY_BACKOFF_MS = 8000;
 
 /**
+ * 各后端的输入长度上限（字符数）。超限会被后端**同步拒绝**。
+ *
+ * ⚠ 这些数字是实测得来，不是任何文档承诺的，随时可能随
+ *   wrapper / opencode 升级而变化——升级后请重新标定。
+ *
+ * opencode 的实测过程（同一 prompt 重复 3 次，结果完全一致）：
+ *   4045 字符 → 成功，耗时 16.2s / 18.1s / 19.9s
+ *   8125 字符 → 成功，耗时 24.0s
+ *   8145 字符 → 失败，耗时 0.117s  ← 毫秒级，不是超时
+ *   8190 字符 → 失败，耗时 0.105s / 0.109s / 0.217s
+ * 边界落在 (8125, 8145]。
+ *
+ * 取 7800 而不是贴着边界：超限的后果是 exit 1 且 stderr 一个字都没有，
+ * 看起来像限流、像后端挂了，实际是长度问题。宁可误伤（给出可操作提示、
+ * 让人拆小重试）也不要静默烧掉一次 2-4 分钟的调用。
+ * 另注：字符数不等于字节数（中文 3 字节），实测阈值随内容构成浮动，
+ * 所以这个值只作保守护栏，不作精确规格。
+ */
+const BACKEND_INPUT_LIMIT = {
+  opencode: 7800,
+};
+// 未列出的后端不设护栏：claude 侧实测 13KB 方案正常评审过。
+function backendInputLimit(backend) {
+  return BACKEND_INPUT_LIMIT[backend] || 0;
+}
+
+/**
  * 同步 sleep。callModel 全程用 spawnSync（阻塞），所以退避也必须同步，
  * 不能用 setTimeout——那会直接返回，重试间隔形同虚设。
  * Atomics.wait 是 Node 里唯一可靠的同步等待手段。
@@ -225,8 +252,46 @@ function callModel(opts) {
   const timeout = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
   const retries = opts.retryCount !== undefined ? opts.retryCount : DEFAULT_RETRY_COUNT;
 
+  // ⚠ 提示词顺序对 opencode 是决定性的。
+  //
+  // 实测（同一问题，只改 stdin 的形状）：
+  //   "角色说明" + --- + "问题"        -> 只回「明白…请提问」，问题整段丢失
+  //   仅 "问题"                        -> 正常作答
+  //   "一句前言" + 空行 + "问题"       -> 只回「明白，请说你的需求」，问题丢失
+  //
+  // opencode 把 stdin 的第一段当"设置/寒暄"，回完就结束这一轮，
+  // 后面的内容压根没进模型。所以任务内容必须排在最前面，
+  // 角色与硬性要求挪到末尾。
+  // claude 侧两种顺序都能收全，保持原样不冒险。
+  const TASK_MUST_LEAD = { opencode: true };
   const rolePrompt = arlRolePrompt(role, backend);
-  const fullPrompt = rolePrompt + '\n\n---\n\n' + taskPrompt;
+  const fullPrompt = TASK_MUST_LEAD[backend]
+    ? (taskPrompt + '\n\n---\n\n' + rolePrompt)
+    : (rolePrompt + '\n\n---\n\n' + taskPrompt);
+
+  // 前置长度检查：超限会被后端同步拒绝（实测 ~120ms），
+  // exit 1 且 stderr 一个字都没有——看起来像限流/后端挂了，
+  // 实际是输入太长。放在这里快速失败并说清楚，省下一次 2-4 分钟的调用。
+  const limit = backendInputLimit(backend);
+  if (limit && fullPrompt.length > limit) {
+    return {
+      ok: false,
+      error: '输入超长：' + fullPrompt.length + ' 字符，超过 ' + backend +
+        ' 后端上限 ' + limit + ' 字符（实测边界 (8125, 8145]，非文档承诺）。' +
+        '该后端会同步拒绝（~120ms、exit 1、无任何错误信息）。',
+      inputTooLong: true,
+      inputChars: fullPrompt.length,
+      limit: limit,
+      backend: backend,
+      role: role,
+      // 拆出各段长度，好让人知道该砍哪一块
+      breakdown: {
+        rolePrompt: rolePrompt.length,
+        taskPrompt: taskPrompt.length,
+        total: fullPrompt.length,
+      },
+    };
+  }
 
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -420,16 +485,37 @@ function callReviser(opts) {
     '维度（用于自检改完是否到位）：' + dims.join('、'),
   ].join('\n');
 
+  // ⚠ 形状对 opencode 是决定性的：必须是「单个连续的祈使句」开头。
+  //
+  // 实测（同一问题，只改 stdin 的形状）：
+  //   "角色说明" + --- + "问题"   -> 只回「明白…请提问」，问题整段丢失
+  //   仅 "问题"（单句祈使）        -> 正常作答
+  //   "一句前言" + 空行 + "问题"  -> 只回「明白，请说你的需求」，问题丢失
+  //   以 markdown 标题开头的方案   -> 只收到标题行，正文全丢
+  //
+  // 规律：opencode 把第一段当"对我说话的开场"回掉就结束这一轮。
+  // 能活下来的形状只有一个——第一句就是祈使句，内容紧随其后不断句。
+  // 所以这里以「请修订…」起头，方案用 <plan> 包裹紧跟，不留标题式开场。
   var tp = [
-    '你是出方案方（Proposer）。下面是待修订的方案，以及对抗评审员（Critic）本轮提出的问题。',
-    '你要做两件事：逐条回应每条问题，并产出完整修订后的方案。',
+    '请修订下面这份方案，逐条回应它收到的评审意见，并按末尾给出的 JSON 结构输出结果。',
     '',
-    '## 当前方案',
+    '<plan>',
     opts.planText,
+    '</plan>',
     '',
-    '## 本轮评审意见（JSON）',
+    '针对它的评审意见（JSON）：',
     JSON.stringify(opts.critique, null, 2),
     '',
+    '--- 以下是你的作业要求 ---',
+    '你是出方案方（Proposer）。不要探索项目文件，不要使用任何工具。',
+    '若上面的 <plan> 标签内没有内容、或评审意见是空的，说明输入没有完整送达，',
+    '此时只输出 {"schemaVersion":1,"responses":[],"revisedPlan":"任务未送达"}，',
+    '不要输出任何模板、示例或占位符。',
+    '否则：reviews 里的每一条都要在 responses 中逐条回应，不许漏；',
+    'rejected 与 partially_accepted 必须给 evidenceLevel(L1/L2/L3) 与非空 evidence；',
+    'revisedPlan 是对 <plan> 的完整重写，不得出现 [描述现状] 这类占位符。',
+    '',
+    '输出结构：',
     schemaHint,
   ].join('\n');
 
@@ -449,10 +535,49 @@ function callReviser(opts) {
       truncated: !!p.truncated, length: p.length, raw: p.raw, rawOutput: r.output,
     };
   }
+  // 哨兵判定放在契约校验之前：模型报告"任务未送达"时，
+  // responses 必然是空数组，validateRevision 会报一串「未回应 issue: i1..i6」，
+  // 把真正的病因（输入没完整送达）埋在噪音里。先认哨兵，报真正的错。
+  if (typeof p.data.revisedPlan === 'string' && p.data.revisedPlan.indexOf('任务未送达') >= 0) {
+    return {
+      ok: false,
+      error: '模型报告任务未送达：该后端只消费 stdin 的第一段，' +
+        '本提示的方案正文与评审意见没进模型。' +
+        '实测规律——opencode 只认「单个连续祈使句」开头的输入；' +
+        '若仍失败请改用 --proposer claude（它能收全整个 stdin）。',
+      taskNotDelivered: true,
+      data: p.data, rawOutput: r.output,
+    };
+  }
+
   const v = validateRevision(p.data, opts.critique);
   if (!v.ok) {
     return {
       ok: false, error: 'Revision校验失败', validationErrors: v.errors,
+      data: p.data, rawOutput: r.output,
+    };
+  }
+  // 占位符检测：模型跑偏时会输出一份"通用方案模板"，字段结构完全合法、
+  // 逐条回应也做得像模像样，但 revisedPlan 里全是 [描述现状] 这类占位符。
+  // 不拦的话，一份模板会被当成"修订稿"接受，而循环随即收敛——比直接失败糟得多。
+  const plan = String(p.data.revisedPlan || '');
+  const placeholders = plan.match(/\[[^\]\n]{2,20}\]/g) || [];
+  // 方案里合理出现方括号的情况极少；真出现时按可疑处理，但只当警告不硬拦
+  const SUSPECT = placeholders.filter((x) => /描述|待填|待定|主题|填写|示例|某某|TODO/i.test(x));
+  if (SUSPECT.length) {
+    return {
+      ok: false,
+      error: '修订稿疑似模板占位符而非真实修订：检出 ' + SUSPECT.length + ' 处（' +
+        SUSPECT.slice(0, 5).join('、') + '）',
+      placeholder: true,
+      placeholders: SUSPECT.slice(0, 10),
+      data: p.data, rawOutput: r.output,
+    };
+  }
+  if (plan.indexOf('任务未送达') >= 0) {
+    return {
+      ok: false, taskNotDelivered: true,
+      error: '修订稿仍是任务未送达哨兵',
       data: p.data, rawOutput: r.output,
     };
   }
@@ -488,7 +613,7 @@ function resolveBackends(preferred, available) {
 module.exports = {
   DEFAULT_WRAPPER, DEFAULT_TIMEOUT_MS, DEFAULT_RETRY_COUNT,
   arlRolePrompt, probeBackend, extractJson, validateCritique, validateRebuttal,
-  validateRevision, callReviser,
+  validateRevision, callReviser, backendInputLimit, BACKEND_INPUT_LIMIT,
   normalizeCritique, FIELD_ALIASES,
   callModel, callCritic, callProposer, callRebutter, resolveBackends,
   SEVERITY_WHITELIST, DIMENSION_WHITELIST, DECISION_WHITELIST, EVIDENCE_WHITELIST
