@@ -11,6 +11,21 @@ const os = require('os');
 const DEFAULT_WRAPPER = 'C:/Users/邱领/.claude/bin/codeagent-wrapper.exe';
 const DEFAULT_TIMEOUT_MS = 120000;
 const DEFAULT_RETRY_COUNT = 2;
+// 退避基数（毫秒）。多轮循环里 critic 与 proposer 是背靠背连发，
+// 失败后立刻硬打很容易连撞 provider 限流，越打越死。
+const RETRY_BACKOFF_MS = 8000;
+
+/**
+ * 同步 sleep。callModel 全程用 spawnSync（阻塞），所以退避也必须同步，
+ * 不能用 setTimeout——那会直接返回，重试间隔形同虚设。
+ * Atomics.wait 是 Node 里唯一可靠的同步等待手段。
+ */
+function sleepMs(ms) {
+  try {
+    const sab = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(sab), 0, 0, ms);
+  } catch (_) { /* 极端环境下退化为不等待，总比抛异常好 */ }
+}
 
 function arlRolePrompt(role, backend) {
   const prompts = {
@@ -70,19 +85,32 @@ function extractJson(text) {
     try { return { ok: true, data: JSON.parse(m[0]) }; } catch (e) { /* 落到截断判定 */ }
   }
 
-  // 截断特征：有对象起始但括号/引号不配平，或结尾没有收尾的 '}'
+  // 截断特征：结尾不是 '}'，或括号计数不配平。
+  // 注意计数可能巧合配平（截断发生在字符串中间时，已闭合的内层对象照样各带一个 }），
+  // 所以真正该看的是「结尾收没收尾」——只报计数会让人误以为配平就没截断。
   const opens = (s.match(/\{/g) || []).length;
   const closes = (s.match(/\}/g) || []).length;
   const startsJson = /^\s*\{/.test(s) || opens > 0;
-  const looksTruncated = startsJson && (opens !== closes || !/\}\s*$/.test(s.trim()));
+  const endsClosed = /\}\s*$/.test(s.trim());
+  const looksTruncated = startsJson && (!endsClosed || opens !== closes);
+
+  let error;
+  if (!looksTruncated) {
+    error = '无法提取有效JSON（输出中未找到可解析的 JSON）';
+  } else if (opens === closes && !endsClosed) {
+    error = '模型输出被截断，JSON 不完整：括号计数恰好配平（' + opens + '/' + closes +
+      '，那是已闭合的内层对象），但结尾不是 }——真正被砍断的是最后一个字符串，共 ' + s.length + ' 字符';
+  } else {
+    error = '模型输出被截断，JSON 不完整（{ ' + opens + ' 个 / } ' + closes +
+      ' 个，结尾' + (endsClosed ? '有 }' : '无 }') + '），共 ' + s.length + ' 字符';
+  }
 
   return {
     ok: false,
-    error: looksTruncated
-      ? '模型输出被截断，JSON 不完整（{' + opens + ' 个 { / ' + closes + ' 个 }，共 ' + s.length + ' 字符）'
-      : '无法提取有效JSON（输出中未找到可解析的 JSON）',
+    error: error,
     truncated: !!looksTruncated,
     length: s.length,
+    tail: s.trim().slice(-60),
     raw: s.substring(0, 500),
   };
 }
@@ -208,13 +236,41 @@ function callModel(opts) {
       });
       const stdout = (result.stdout || '').trim();
       const stderr = (result.stderr || '').trim();
-      const isWrapperDiagnostic=stderr.startsWith('[codeagent-wrapper]');if (!isWrapperDiagnostic&&stderr&&!stdout){lastError=new Error('wrapper stderr: '+stderr.substring(0,500));if(attempt<retries)continue;return{ok:false,error:lastError.message,attempt:attempt+1};}
-      if (result.error) { lastError = result.error; if (attempt < retries) continue; return {ok:false,error:result.error.message,attempt:attempt+1}; }
-      if (result.status !== 0 && !stdout) { lastError = new Error('exit '+result.status+': '+stderr.substring(0,200)); if (attempt < retries) continue; return {ok:false,error:lastError.message,attempt:attempt+1}; }
-      return {ok:true,output:stdout,role:role,backend:backend,attempt:attempt+1};
-    } catch(e) { lastError = e; if (attempt < retries) continue; }
+      const isWrapperDiagnostic = stderr.startsWith('[codeagent-wrapper]');
+      if (!isWrapperDiagnostic && stderr && !stdout) {
+        lastError = new Error('wrapper stderr: ' + stderr.substring(0, 500));
+        if (attempt < retries) continue;
+        return { ok: false, error: lastError.message, attempt: attempt + 1, stderr: stderr.substring(0, 1000) };
+      }
+      if (result.error) {
+        lastError = result.error;
+        if (attempt < retries) continue;
+        return { ok: false, error: result.error.message, attempt: attempt + 1 };
+      }
+      if (result.status !== 0 && !stdout) {
+        // 原来只截 200 字符：wrapper 的诊断头（"[codeagent-wrapper] Command: ..."）
+        // 就把配额吃光，真正的后端错误（限流 / 上游 5xx / 模型名不对）全被切掉，
+        // 只剩一句没信息量的 "exit 1"。实测踩到。
+        // 改成丢掉 wrapper 诊断头之后取 600 字符，并在有 stderr 时优先用它。
+        const backendErr = isWrapperDiagnostic
+          ? stderr.replace(/^\[codeagent-wrapper\][^\n]*\n?/gm, '').trim()
+          : stderr;
+        const detail = backendErr ? backendErr.substring(0, 600) : '(无 stderr)';
+        lastError = new Error('exit ' + result.status + ' [' + backend + ']: ' + detail);
+        if (attempt < retries) {
+          // 背靠背连发容易撞限流，失败后退避再试，别立刻硬打
+          sleepMs(RETRY_BACKOFF_MS * (attempt + 1));
+          continue;
+        }
+        return {
+          ok: false, error: lastError.message, attempt: attempt + 1,
+          exitStatus: result.status, stderr: stderr.substring(0, 1000),
+        };
+      }
+      return { ok: true, output: stdout, role: role, backend: backend, attempt: attempt + 1 };
+    } catch (e) { lastError = e; if (attempt < retries) continue; }
   }
-  return {ok:false,error:lastError?lastError.message:'unknown',attempt:retries+1};
+  return { ok: false, error: lastError ? lastError.message : 'unknown', attempt: retries + 1 };
 }
 
 function callCritic(opts) {
@@ -259,7 +315,7 @@ function callCritic(opts) {
       : '';
     return {
       ok: false, error: 'JSON解析失败:' + p.error + hint,
-      truncated: !!p.truncated, length: p.length,
+      truncated: !!p.truncated, length: p.length, tail: p.tail,
       raw: p.raw, rawOutput: r.output,
     };
   }
@@ -272,6 +328,135 @@ function callCritic(opts) {
   const v = validateCritique(norm.data, dims);
   if (!v.ok) return {ok:false,error:'Critique校验失败',validationErrors:v.errors,data:norm.data,rawOutput:r.output,repairs:norm.repairs};
   return {ok:true,data:norm.data,rawOutput:r.output,attempt:r.attempt,repairs:norm.repairs};
+}
+
+/**
+ * 修订方（决策层多轮循环的 proposer 侧）返回值的校验。
+ *
+ * 契约来自 SKILL.md §5.6.3 的「逐条回应(可拒绝但须给证据)」：
+ *   1. responses 必须覆盖 critique 里【每一条】issue，且不重复、不夹带不存在的 id
+ *   2. decision ∈ accepted / rejected / partially_accepted
+ *   3. rejected 与 partially_accepted 必须附 evidenceLevel(L1/L2/L3) 与非空 evidence
+ *      ——「可拒绝但须给证据」，没证据的拒绝等于绕开问题
+ *   4. revisedPlan 必须是完整、非空的方案原文
+ *
+ * 为什么 responses 与 revisedPlan 放同一次调用里返回：
+ * 让「回应」与「改完的方案」出自同一次推理，不会出现
+ * 回应里说采纳 A、方案里却没改 A 的自相矛盾——驱动逐条校验后才发现。
+ */
+function validateRevision(data, critique) {
+  const errors = [];
+  if (!data || typeof data !== 'object') return { ok: false, errors: ['数据不是对象'] };
+  if (data.schemaVersion === undefined) errors.push('缺少schemaVersion');
+  if (!Array.isArray(data.responses)) errors.push('缺少responses数组');
+  if (typeof data.revisedPlan !== 'string' || !data.revisedPlan.trim()) {
+    errors.push('revisedPlan 必须是非空字符串');
+  }
+
+  const issueIds = (critique && critique.issues ? critique.issues : []).map(function (i) {
+    return String(i.id);
+  });
+  if (Array.isArray(data.responses)) {
+    const seen = new Set();
+    data.responses.forEach(function (resp, idx) {
+      if (!resp || typeof resp !== 'object') {
+        errors.push('responses[' + idx + ']不是对象');
+        return;
+      }
+      const id = String(resp.issueId);
+      if (!issueIds.includes(id)) {
+        errors.push('responses[' + idx + ']issueId ' + id + ' 不在本次critique中');
+      } else if (seen.has(id)) {
+        errors.push('responses[' + idx + ']issueId ' + id + ' 重复回应');
+      }
+      seen.add(id);
+      if (!resp.decision || !DECISION_WHITELIST.includes(resp.decision)) {
+        errors.push('responses[' + idx + ']decision无效:' + resp.decision);
+      }
+      if (resp.decision === 'rejected' || resp.decision === 'partially_accepted') {
+        if (!resp.evidenceLevel || !EVIDENCE_WHITELIST.includes(resp.evidenceLevel)) {
+          errors.push('responses[' + idx + ']evidenceLevel无效:' + resp.evidenceLevel + '（拒绝/部分采纳必须给证据等级）');
+        }
+        if (!resp.evidence || !String(resp.evidence).trim()) {
+          errors.push('responses[' + idx + ']evidence为空（拒绝/部分采纳必须有证据）');
+        }
+      }
+    });
+    issueIds.forEach(function (id) {
+      if (!seen.has(id)) errors.push('未回应 issue: ' + id);
+    });
+  }
+  return { ok: errors.length === 0, errors: errors };
+}
+
+/**
+ * 决策层多轮循环的修订调用：给定方案原文 + 上一轮 critique，
+ * 返回「逐条回应 + 完整修订后的方案」。
+ */
+function callReviser(opts) {
+  var dims = (opts && opts.dimensions) || DIMENSION_WHITELIST;
+  var issues = (opts && opts.critique && opts.critique.issues) || [];
+  var idList = issues.map(function (i) { return i.id; });
+  var schemaHint = [
+    '严格按以下 JSON 结构输出，不要有多余字段，不要 markdown 代码块：',
+    '{',
+    '  "schemaVersion": 1,',
+    '  "responses": [',
+    '    { "issueId": "' + (idList[0] || 'i1') + '",',
+    '      "decision": "accepted|rejected|partially_accepted",',
+    '      "evidenceLevel": "L1|L2|L3",   // 仅 rejected / partially_accepted 需要',
+    '      "evidence": "证据",             // 仅 rejected / partially_accepted 需要',
+    '      "response": "逐条说明" }',
+    '  ],',
+    '  "revisedPlan": "完整修订后的方案原文（markdown，直接是正文，不要包在代码块里）"',
+    '}',
+    '',
+    'responses 必须对本轮的 ' + issues.length + ' 条问题逐条回应，一条不漏：' + idList.join('、'),
+    'decision 只能是 accepted / rejected / partially_accepted 三选一；',
+    'rejected 与 partially_accepted 必须同时给 evidenceLevel（L1/L2/L3）与非空 evidence；',
+    'accepted 可以不写 evidenceLevel；',
+    'revisedPlan 必须是【完整】的方案原文，读者只看它就能实施，不能只写 diff 或增量；',
+    '被拒绝的问题必须在 revisedPlan 里真正改掉或明确写出为何不改，否则视为未解决。',
+    '维度（用于自检改完是否到位）：' + dims.join('、'),
+  ].join('\n');
+
+  var tp = [
+    '你是出方案方（Proposer）。下面是待修订的方案，以及对抗评审员（Critic）本轮提出的问题。',
+    '你要做两件事：逐条回应每条问题，并产出完整修订后的方案。',
+    '',
+    '## 当前方案',
+    opts.planText,
+    '',
+    '## 本轮评审意见（JSON）',
+    JSON.stringify(opts.critique, null, 2),
+    '',
+    schemaHint,
+  ].join('\n');
+
+  const r = callModel({
+    backend: opts.backend, role: 'proposer', workdir: opts.workdir,
+    taskPrompt: tp, wrapperPath: opts.wrapperPath,
+    timeoutMs: opts.timeoutMs, retryCount: opts.retryCount,
+  });
+  if (!r.ok) return r;
+  const p = extractJson(r.output);
+  if (!p.ok) {
+    const hint = p.truncated
+      ? ' —— 修订稿过长被截断。请让 revisedPlan 更紧凑，或把方案拆小后分轮修订。'
+      : '';
+    return {
+      ok: false, error: 'JSON解析失败:' + p.error + hint,
+      truncated: !!p.truncated, length: p.length, raw: p.raw, rawOutput: r.output,
+    };
+  }
+  const v = validateRevision(p.data, opts.critique);
+  if (!v.ok) {
+    return {
+      ok: false, error: 'Revision校验失败', validationErrors: v.errors,
+      data: p.data, rawOutput: r.output,
+    };
+  }
+  return { ok: true, data: p.data, rawOutput: r.output, attempt: r.attempt };
 }
 
 function callProposer(opts) {
@@ -303,6 +488,7 @@ function resolveBackends(preferred, available) {
 module.exports = {
   DEFAULT_WRAPPER, DEFAULT_TIMEOUT_MS, DEFAULT_RETRY_COUNT,
   arlRolePrompt, probeBackend, extractJson, validateCritique, validateRebuttal,
+  validateRevision, callReviser,
   normalizeCritique, FIELD_ALIASES,
   callModel, callCritic, callProposer, callRebutter, resolveBackends,
   SEVERITY_WHITELIST, DIMENSION_WHITELIST, DECISION_WHITELIST, EVIDENCE_WHITELIST

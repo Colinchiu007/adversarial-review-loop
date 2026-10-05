@@ -522,9 +522,13 @@ function runDecisionLayer(sha, proposalFile) {
   const dir = path.join(REPO, ".adversarial", slug);
   fs.mkdirSync(dir, { recursive: true });
 
+  // --rounds 覆盖引擎默认轮数；必须在 dry-run 之前解析，
+  // 否则 dry-run 报的 maxRounds 与真正会跑的轮数不一致。
+  const maxRounds = Math.max(1, parseInt(arg("--rounds", "") || cfg.maxRounds, 10) || cfg.maxRounds);
+
   if (DRY_RUN) {
     console.log(`[dry-run] 将创建 ${path.relative(REPO, dir)}`);
-    console.log(`[dry-run] 引擎配置: ${JSON.stringify({ objectType: cfg.objectType, maxRounds: cfg.maxRounds, dimensions: cfg.dimensions, selfPlay: cfg.selfPlay })}`);
+    console.log(`[dry-run] 引擎配置: ${JSON.stringify({ objectType: cfg.objectType, maxRounds: maxRounds, roundsFrom: arg("--rounds", "") ? "--rounds" : "engine-default", proposer: cfg.proposer, critic: cfg.critic, dimensions: cfg.dimensions })}`);
     return 0;
   }
 
@@ -536,81 +540,201 @@ function runDecisionLayer(sha, proposalFile) {
     familyMap: FAMILY_MAP,
   });
 
-  engine.writeArtifact(dir, "proposal-v1.md", text);
-  console.log(`\n[轮 1/${cfg.maxRounds}] 调用 critic=${cfg.critic} 对方案挑刺...`);
+  // ---------- 多轮循环 ----------
+  // 实测踩到的设计缺口：这里原来只调一次 critic 就出裁决，
+  // 但日志却打印「[轮 1/3]」——承诺 3 轮、实际 1 轮。
+  // 出方案方永远没有机会回应 Critical，多轮收敛形同虚设。
+  //
+  // 现在按「critic 挑刺 → proposer 逐条回应并改方案 → 再评审」真跑，
+  // 终止条件与原来一致（只由 Critical 数与最低维度分决定）：
+  //   有 Critical            → 还要下一轮
+  //   无 Critical 且 minScore ≥ 阈值 → cleared，立即停
+  //   无 Critical 且 minScore < 阈值 → 还要下一轮
+  //   轮次耗尽               → 还有 Critical 记 blocked，否则 needs_revision
+  const threshold = cfg.scoreThreshold || 8.0;
+  const history = [];
+  let planText = text;
+  let critique = null;
+  let sc = null;
+  let minScore = null;
+  let critCritical = 0;
+  let stoppedBy = "converged";
 
-  let cr;
-  try {
-    cr = mc.callCritic({
-      backend: cfg.critic,
-      workdir: REPO,
-      roundN: 1,
-      proposalText: text,
-      dimensions: cfg.dimensions,
-      wrapperPath: mc.DEFAULT_WRAPPER,
-      timeoutMs: cfg.timeoutMs,
-      retryCount: cfg.retryCount,
+  for (let round = 1; round <= maxRounds; round++) {
+    engine.writeArtifact(dir, `proposal-v${round}.md`, planText);
+    console.log(`\n[轮 ${round}/${maxRounds}] 调用 critic=${cfg.critic} 对方案挑刺...`);
+
+    let cr;
+    try {
+      cr = mc.callCritic({
+        backend: cfg.critic,
+        workdir: REPO,
+        roundN: round,
+        proposalText: planText,
+        dimensions: cfg.dimensions,
+        wrapperPath: mc.DEFAULT_WRAPPER,
+        timeoutMs: cfg.timeoutMs,
+        retryCount: cfg.retryCount,
+      });
+    } catch (err) {
+      console.error("评审调用异常: " + err.message);
+      return 2;
+    }
+    if (!cr || !cr.ok) {
+      // 失败必须可诊断：打印校验明细 + 模型原始返回片段，
+      // 否则只能看到一句「Critique校验失败」，无法定位。
+      console.error("评审失败: " + ((cr && cr.error) || "未知原因"));
+      if (cr && cr.validationErrors && cr.validationErrors.length) {
+        console.error("  校验错误:");
+        cr.validationErrors.slice(0, 8).forEach(function (e) { console.error("    - " + e); });
+      }
+      if (cr && cr.rawOutput) {
+        const snippet = String(cr.rawOutput).slice(0, 600);
+        console.error("  模型原始返回（前 600 字符）:");
+        console.error("    " + snippet.replace(/\n/g, "\n    "));
+      }
+      writeBack(sha, {
+        required: true, layer: "decision", status: "error", performedBy: cfg.critic,
+        objectType: "plan", rounds: history,
+        error: String((cr && cr.error) || "未知原因"),
+        validationErrors: (cr && cr.validationErrors) || null,
+        note: `第 ${round} 轮评审失败`,
+        artifacts: path.relative(REPO, dir),
+        at: new Date().toISOString(),
+      });
+      return 2;
+    }
+
+    critique = cr.data;
+    engine.writeArtifact(dir, `critique-v${round}.md`, JSON.stringify(critique, null, 2));
+    sc = extractScores(critique);
+    minScore = sc.min;
+    const critCount = (critique.issues || []).length;
+    critCritical = (critique.issues || []).filter((i) => i.severity === "Critical").length;
+    history.push({
+      round: round,
+      issues: critCount,
+      critical: critCritical,
+      minScore: minScore,
+      dimensionScores: sc.dimScores,
     });
-  } catch (err) {
-    console.error("评审调用异常: " + err.message);
-    return 2;
-  }
-  if (!cr || !cr.ok) {
-    // 失败必须可诊断：打印校验明细 + 模型原始返回片段，
-    // 否则只能看到一句「Critique校验失败」，无法定位。
-    console.error("评审失败: " + ((cr && cr.error) || "未知原因"));
-    if (cr && cr.validationErrors && cr.validationErrors.length) {
-      console.error("  校验错误:");
-      cr.validationErrors.slice(0, 8).forEach(function (e) { console.error("    - " + e); });
+    console.log(
+      `  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），` +
+        `最低维度分 ${minScore}（${sc.keys.join("/") || "无维度分"}）`
+    );
+
+    // 评审不可判定：无论第几轮都不能继续，也不许当通过
+    if (!isReviewDecidable(sc)) {
+      stoppedBy = "incomplete";
+      break;
     }
-    if (cr && cr.rawOutput) {
-      const snippet = String(cr.rawOutput).slice(0, 600);
-      console.error("  模型原始返回（前 600 字符）:");
-      console.error("    " + snippet.replace(/\n/g, "\n    "));
+    // 唯一放行条件
+    if (critCritical === 0 && minScore >= threshold) {
+      stoppedBy = "converged";
+      break;
     }
-    return 2;
+    if (round === maxRounds) {
+      stoppedBy = "maxRounds";
+      break;
+    }
+
+    // 还要下一轮：让 proposer 逐条回应并改方案
+    console.log(`  未收敛（Critical ${critCritical} / 最低分 ${minScore}），调用 proposer=${cfg.proposer} 逐条回应并修订...`);
+    let rv;
+    try {
+      rv = mc.callReviser({
+        backend: cfg.proposer,
+        workdir: REPO,
+        roundN: round,
+        planText: planText,
+        critique: critique,
+        dimensions: cfg.dimensions,
+        wrapperPath: mc.DEFAULT_WRAPPER,
+        timeoutMs: cfg.timeoutMs,
+        retryCount: cfg.retryCount,
+      });
+    } catch (err) {
+      console.error("修订调用异常: " + err.message);
+      return 2;
+    }
+    if (!rv || !rv.ok) {
+      console.error("修订失败: " + ((rv && rv.error) || "未知原因"));
+      if (rv && rv.validationErrors && rv.validationErrors.length) {
+        console.error("  校验错误:");
+        rv.validationErrors.slice(0, 10).forEach(function (e) { console.error("    - " + e); });
+      }
+      if (rv && rv.rawOutput) {
+        console.error("  模型原始返回（前 600 字符）:");
+        console.error("    " + String(rv.rawOutput).slice(0, 600).replace(/\n/g, "\n    "));
+      }
+      writeBack(sha, {
+        required: true, layer: "decision", status: "error", performedBy: cfg.proposer,
+        objectType: "plan", rounds: history,
+        error: String((rv && rv.error) || "未知原因"),
+        validationErrors: (rv && rv.validationErrors) || null,
+        note: `第 ${round} 轮修订失败`,
+        artifacts: path.relative(REPO, dir),
+        at: new Date().toISOString(),
+      });
+      return 2;
+    }
+
+    engine.writeArtifact(dir, `revision-v${round}.md`, JSON.stringify(rv.data, null, 2));
+    const revised = String(rv.data.revisedPlan || "").trim();
+    if (!revised || revised === planText.trim()) {
+      // 回应了但方案一个字没改：再跑一轮也是同样的结果，白烧 token
+      console.log("  ⚠ 修订稿与当前方案无差异 —— 提前停止（继续循环不会改变结果）");
+      stoppedBy = "no_revision";
+      break;
+    }
+    const accepted = (rv.data.responses || []).filter((r) => r.decision === "accepted").length;
+    const rejected = (rv.data.responses || []).filter((r) => r.decision === "rejected").length;
+    const partial = (rv.data.responses || []).filter((r) => r.decision === "partially_accepted").length;
+    console.log(`  修订完成：采纳 ${accepted} / 有证据拒绝 ${rejected} / 部分采纳 ${partial}`);
+    planText = revised;
   }
 
-  const critique = cr.data;
-  engine.writeArtifact(dir, "critique-v1.md", JSON.stringify(critique, null, 2));
-  const sc = extractScores(critique);
-  const minScore = sc.min;
-  const critIssues = critique.issues || [];
-  const critCount = critIssues.length;
-  const critCritical = critIssues.filter((i) => i.severity === "Critical").length;
-  console.log(
-    `  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），` +
-      `最低维度分 ${minScore}（${sc.keys.join("/") || "无维度分"}）`
-  );
-
-  // 决策层裁决：出方案方尚未回应，只可能"继续"或"升级"，不存在"收敛"
+  // ---------- 裁决 ----------
   let verdict, verdictWhy;
-  if (critCritical > 0) {
-    verdict = "blocked";
-    verdictWhy = `评审方提出 ${critCritical} 条 Critical，必须由出方案方逐条回应（可拒绝但须给证据）后才能动手`;
-  } else if (!isReviewDecidable(sc)) {
+  if (stoppedBy === "incomplete") {
     verdict = "incomplete";
     verdictWhy =
       "评审结果不完整（没有维度分），无法判定是否达标。" +
       "重跑仍无维度分则需检查 critic 契约——不允许把这种结果当作通过";
-  } else if (minScore >= (cfg.scoreThreshold || 8.0)) {
+  } else if (stoppedBy === "converged") {
     verdict = "cleared";
-    verdictWhy = `无 Critical 且最低维度分 ${minScore} ≥ ${cfg.scoreThreshold}，方案可执行`;
+    verdictWhy = `第 ${history.length} 轮无 Critical 且最低维度分 ${minScore} ≥ ${threshold}，方案可执行`;
+  } else if (critCritical > 0) {
+    verdict = "blocked";
+    verdictWhy =
+      `跑满 ${maxRounds} 轮仍有 ${critCritical} 条 Critical 未解决，` +
+      "必须由出方案方逐条回应（可拒绝但须给证据）后才能动手";
   } else {
     verdict = "needs_revision";
-    verdictWhy = `无 Critical 但最低维度分 ${minScore} < ${cfg.scoreThreshold}，建议先补强再动手`;
+    verdictWhy =
+      `跑满 ${maxRounds} 轮无 Critical 但最低维度分仍为 ${minScore} < ${threshold}；` +
+      (stoppedBy === "no_revision" ? "且修订稿与原方案无差异，自动循环已无法推进" : "建议继续补强");
   }
+
+  console.log(`\n── 多轮轨迹 ──`);
+  history.forEach((h) => {
+    console.log(
+      `  轮${h.round}: 问题 ${h.issues} 条（Critical ${h.critical}）` +
+        `  最低分 ${h.minScore === null ? "无" : h.minScore}`
+    );
+  });
+  console.log(`  停止原因: ${stoppedBy}`);
 
   console.log(`\n决策层裁决: ${verdict}`);
   console.log(`  ${verdictWhy}`);
-  console.log(`  产物: ${path.relative(REPO, dir)}（proposal-v1 / critique-v1 已配对落盘）`);
+  console.log(`  产物: ${path.relative(REPO, dir)}（proposal-vN / critique-vN / revision-vN 已配对落盘）`);
 
   if (verdict === "blocked") {
-    console.log("  → 需在方案里逐条回应 Critical 后重跑本脚本，收敛才可动手");
+    console.log("  → Critical 未解决，需人工介入或提高方案质量后重跑");
   } else if (verdict === "incomplete") {
     console.log("  → 阻断：评审不完整不等于通过");
   } else if (verdict === "needs_revision") {
-    console.log("  → 可动手，但建议按 critique 补强；补强后重跑会重新判定");
+    console.log("  → 可动手，但建议按最后一轮 critique 补强");
   }
 
   writeBack(sha, {
@@ -621,12 +745,20 @@ function runDecisionLayer(sha, proposalFile) {
     objectType: "plan",
     minScore: minScore,
     dimensionScores: sc.dimScores,
-    findings: critIssues,
+    findings: critique.issues || [],
+    rounds: history,
+    roundsRun: history.length,
+    roundsMax: maxRounds,
+    stoppedBy: stoppedBy,
     note: verdictWhy,
     artifacts: path.relative(REPO, dir),
     at: new Date().toISOString(),
   });
-  return verdict === "cleared" ? 0 : 1;
+  // incomplete 是「判不出来」，属于契约/环境故障，与「有阻断」不是一回事：
+  // 用 2 把它和 blocked/needs_revision（都是 1）区分开，调用方才能对症处理。
+  if (verdict === "cleared") return 0;
+  if (verdict === "incomplete") return 2;
+  return 1;
 }
 
 // ---------- main ----------
