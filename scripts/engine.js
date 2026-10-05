@@ -55,33 +55,127 @@ function isStalled(rounds, cfg) {
   return { stalled: stalled, rounds: window.map(function (r) { return r.round; }), deltas: deltas };
 }
 
+// ---------- 自扮演裁决（第三档收敛出口） ----------
+// 动机：stall / maxRounds 之后，原有出口只有 autoAccept（默认）或 escalated（给人）。
+// 在 CI 里 escalated 等于超时失败。自扮演让当前 LLM 扮演对抗双方做一次裁决，
+// 成本是一次本地推理、无外部进程，把"等人"换成"秒级有个结论"。
+//
+// 但自扮演的置信度低于真跨家族：同模型的盲区是相关的，它可能在"指控"和"辩护"
+// 两侧犯同一个错。所以：
+//   1. 结论必须标注 adjudicatedBy='self-play'，与 dual-model 区分
+//   2. 置信度打折（默认 0.6）
+//   3. 高危域（auth / 加密 / 数据库迁移）的争议项不允许自扮演豁免，必须外部复核
+
+var HIGH_RISK_DOMAINS = [
+  { key: 'auth', label: '鉴权/授权', re: /(auth|login|logout|signin|signup|session|jwt|oauth|sso|permission|acl|rbac|csrf)/i },
+  { key: 'crypto', label: '加密/密钥', re: /(crypto|cipher|encrypt|decrypt|bcrypt|scrypt|argon2|pbkdf2|\bhash\b|salt|password|secret|private[_-]?key|credential|\baes\b|\brsa\b|\bdes\b|加密|解密|密钥|口令|密码|凭据)/i },
+  { key: 'datamigration', label: '数据库/迁移', re: /(migration|migrate|schema|alter[_\s]table|drop[_\s]table|backfill|数据迁移|建表|改表)/i }
+];
+
+function classifyHighRisk(text) {
+  var s = String(text || '');
+  var hits = [];
+  for (var i = 0; i < HIGH_RISK_DOMAINS.length; i++) {
+    if (HIGH_RISK_DOMAINS[i].re.test(s)) hits.push(HIGH_RISK_DOMAINS[i].key);
+  }
+  return hits;
+}
+
+/** 收集最后一轮里"未解决"的争议项（被接受或被驳回的都算已处理） */
+function collectUnresolved(lastRound) {
+  if (!lastRound) return [];
+  var handled = new Set();
+  (lastRound.processed && lastRound.processed.accepted || []).forEach(function (r) { handled.add(String(r.issueId)); });
+  (lastRound.processed && lastRound.processed.rejected || []).forEach(function (r) { handled.add(String(r.issueId)); });
+  (lastRound.processed && lastRound.processed.rejectedWithEvidence || []).forEach(function (r) { handled.add(String(r.issueId)); });
+  (lastRound.processed && lastRound.processed.partiallyAccepted || []).forEach(function (r) { handled.add(String(r.issueId)); });
+  var issues = (lastRound.critique && lastRound.critique.issues) || [];
+  return issues.filter(function (i) {
+    return !handled.has(String(i.id)) && (i.severity === 'Critical' || i.severity === 'Warning');
+  });
+}
+
+/**
+ * 判断能否降级到自扮演裁决。
+ * 返回 { allowed, confidenceWeight, items, requiresExternalReview[] }
+ */
+function evaluateSelfPlay(task, cfg) {
+  var sp = (cfg && cfg.selfPlay) || {};
+  var weight = typeof sp.confidenceWeight === 'number' ? sp.confidenceWeight : 0.6;
+  var last = task.rounds[task.rounds.length - 1];
+  var unresolved = collectUnresolved(last);
+  if (unresolved.length === 0) {
+    return { allowed: false, reason: 'no_unresolved', confidenceWeight: weight, items: [], requiresExternalReview: [] };
+  }
+  var mustExternal = [];
+  var items = unresolved.map(function (i) {
+    var domains = classifyHighRisk([i.finding, i.detail, i.category, i.file].join(' '));
+    if (domains.length) mustExternal.push({ id: i.id, severity: i.severity, domains: domains });
+    return {
+      id: i.id,
+      severity: i.severity,
+      finding: i.finding,
+      highRiskDomains: domains
+    };
+  });
+  // 全是高危域 → 不允许自扮演豁免，必须外部复核
+  if (mustExternal.length === items.length) {
+    return {
+      allowed: false, reason: 'all_high_risk', confidenceWeight: weight,
+      items: items, requiresExternalReview: mustExternal
+    };
+  }
+  return {
+    allowed: true, reason: 'partial_high_risk', confidenceWeight: weight,
+    items: items, requiresExternalReview: mustExternal
+  };
+}
+
 function convergenceDecision(task, cfg) {
   var last = task.rounds[task.rounds.length - 1];
   var minScore = last ? last.minScore : null;
   var maxRounds = (cfg && cfg.maxRounds) || 3;
   var threshold = (cfg && cfg.scoreThreshold) || 8.0;
   var autoAccept = !!(cfg && cfg.autoAcceptOnStall);
+  var selfPlayEnabled = !!(cfg && cfg.selfPlay && cfg.selfPlay.enabled);
   if (minScore !== null && minScore >= threshold) {
     return { stop: true, reason: 'score', minScore: minScore, status: 'converged' };
   }
   var st = isStalled(task.rounds, cfg);
+  // stall / 轮次耗尽时，优先尝试自扮演裁决（第三档出口），避免直接升级给人
+  var trySelfPlay = function (fallbackReason, extra) {
+    if (selfPlayEnabled && !autoAccept) {
+      var sp = evaluateSelfPlay(task, cfg);
+      if (sp.allowed) {
+        return Object.assign({
+          stop: true, reason: 'selfPlay', minScore: minScore,
+          status: 'self_play', selfPlay: sp
+        }, extra || {});
+      }
+    }
+    return Object.assign({
+      stop: true, reason: fallbackReason, minScore: minScore,
+      status: autoAccept ? 'auto_accepted' : 'escalated'
+    }, extra || {});
+  };
   if (st.stalled) {
-    return { stop: true, reason: 'stall', minScore: minScore, status: autoAccept ? 'auto_accepted' : 'escalated', stallDetail: st };
+    return trySelfPlay('stall', { stallDetail: st });
   }
   if (task.currentRound >= maxRounds) {
-    return { stop: true, reason: 'maxRounds', minScore: minScore, status: autoAccept ? 'auto_accepted' : 'escalated' };
+    return trySelfPlay('maxRounds', {});
   }
   return { stop: false, reason: 'continue', minScore: minScore };
 }
 
 // ---------- 状态机 ----------
-var VALID_STATES = ['initialized','in_progress','converged','escalated','auto_accepted','error','archived'];
+var VALID_STATES = ['initialized','in_progress','converged','escalated','auto_accepted','self_play','error','archived'];
 var TRANSITIONS = {
   initialized: ['in_progress','error'],
-  in_progress: ['converged','escalated','auto_accepted','error'],
+  in_progress: ['converged','escalated','auto_accepted','self_play','error'],
   converged: ['archived'],
   escalated: ['archived','in_progress'],
   auto_accepted: ['archived'],
+  self_play: ['archived','escalated','in_progress'],
   error: ['in_progress','archived'],
   archived: []
 };
@@ -227,5 +321,9 @@ module.exports = {
   TRANSITIONS: TRANSITIONS, canTransition: canTransition, validateTransition: validateTransition,
   processRebuttal: processRebuttal, computeCriticalRemaining: computeCriticalRemaining,
   validateSlug: validateSlug, atomicWriteJson: atomicWriteJson, writeArtifact: writeArtifact,
-  ensurePairing: ensurePairing, detectOrphans: detectOrphans
+  ensurePairing: ensurePairing, detectOrphans: detectOrphans,
+  // 自扮演裁决
+  HIGH_RISK_DOMAINS: HIGH_RISK_DOMAINS,
+  classifyHighRisk: classifyHighRisk, collectUnresolved: collectUnresolved,
+  evaluateSelfPlay: evaluateSelfPlay
 };
