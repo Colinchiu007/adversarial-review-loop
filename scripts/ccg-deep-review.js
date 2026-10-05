@@ -108,14 +108,53 @@ function cfgForMode(mode) {
 }
 
 // ---------- 读取判定结果 ----------
+// 判定记录按 sha 命名，但 pre-commit 跑判定器时新 commit 还不存在，
+// currentSha() 拿到的是【父提交】。提交完 HEAD 变成新 sha，
+// 按新 sha 找记录必然找不到 → deep-review.sh 直接「跳过深度审查」exit 0，
+// 验证层在真实流程里从来没跑起来过。
+//
+// 修法：记录里额外存 stagedDiffHash（暂存区 diff 的哈希，排除 .ccg 自身），
+// 找不到 <sha>.json 时按这个内容寻址回退。
+// 为什么不用 git write-tree：判定器自己的输出也会被 git add 进同一个
+// commit，tree 因此移位，键对不上——实测踩过。
 function readDecision(sha) {
-  const f = path.join(REPO, ".ccg", "reviews", `${sha}.json`);
-  if (!fs.existsSync(f)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(f, "utf8"));
-  } catch (_) {
-    return null;
+  const dir = path.join(REPO, ".ccg", "reviews");
+  const f = path.join(dir, `${sha}.json`);
+  if (fs.existsSync(f)) {
+    try {
+      const r = JSON.parse(fs.readFileSync(f, "utf8"));
+      r._recordFile = path.join(".ccg", "reviews", `${sha}.json`);
+      return r;
+    } catch (_) { /* 落到 diff 哈希寻址 */ }
   }
+
+  let want = "";
+  try {
+    const d = execFileSync(
+      "git", ["diff", `${sha}^`, sha, "--", ".", ":(exclude).ccg"],
+      { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }
+    );
+    if (d && d.trim()) want = require("crypto").createHash("sha256").update(d).digest("hex");
+  } catch (_) { return null; }
+  if (!want) return null;
+
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+  } catch (_) { return null; }
+  for (const n of names) {
+    if (n === `${sha}.json`) continue;
+    let rec;
+    try {
+      rec = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
+    } catch (_) { continue; }
+    if (rec && rec.stagedDiffHash && rec.stagedDiffHash === want) {
+      rec._recordFile = path.join(".ccg", "reviews", n);
+      rec._matchedBy = "stagedDiffHash";
+      return rec;
+    }
+  }
+  return null;
 }
 
 function currentSha() {
@@ -478,6 +517,10 @@ function main() {
     console.log("⏭ 未找到 .ccg/reviews/" + sha.slice(0, 8) + ".json —— 提交时未跑判定器，跳过深度审查");
     console.log("   （若这是 CI 上首次运行，请先在本地提交一次以生成判定记录）");
     return 0;
+  }
+  if (decision._matchedBy === "stagedDiffHash") {
+    console.log(`判定记录按 diff 内容寻址命中: ${decision._recordFile}`);
+    console.log(`（pre-commit 时新 commit 尚未生成，判定记录写在父 sha 上——这是预期行为）`);
   }
 
   const mode = decision.mode;
