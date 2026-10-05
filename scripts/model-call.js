@@ -123,13 +123,40 @@ function callModel(opts) {
 }
 
 function callCritic(opts) {
-  const tp = '请评审以下方案（第'+opts.roundN+'轮）：\n\n'+opts.proposalText+'\n\n请输出JSON格式的评审结果。';
+  // 契约必须写进 prompt：模型不知道要哪些维度 / severity 白名单 / 字段结构时，
+  // 只能自己编 JSON，validateCritique 必然失败。
+  // 这是实测踩到的：没传 schema 时 critic 返回的结构完全不合规。
+  var dims = (opts && opts.dimensions) || DIMENSION_WHITELIST;
+  var schemaHint = [
+    '严格按以下 JSON 结构输出，不要有多余字段，不要 markdown 代码块：',
+    '{',
+    '  "schemaVersion": 1,',
+    '  "issues": [',
+    '    { "severity": "Critical|Warning|Info",',
+    '      "dimension": "' + dims.join('|') + '",',
+    '      "finding": "具体问题，必须可验证",',
+    '      "suggestion": "具体改法" }',
+    '  ],',
+    '  "dimensionScores": {',
+    dims.map(function (d) { return '    "' + d + '": 1-10 的整数'; }).join(',\n'),
+    '  }',
+    '}',
+    '',
+    'severity 只能是 Critical / Warning / Info 三选一；',
+    'dimension 只能是上面列出的维度之一；',
+    '每个维度都要在 dimensionScores 里给出 1-10 分；',
+    '没有问题时 issues 给空数组，但仍必须给出全部维度的分数。',
+  ].join('\n');
+
+  var tp = '请评审以下方案（第' + opts.roundN + '轮）：\n\n' + opts.proposalText
+    + '\n\n' + schemaHint + '\n\n请输出JSON格式的评审结果。';
+
   const r = callModel({backend:opts.backend,role:'critic',workdir:opts.workdir,taskPrompt:tp,wrapperPath:opts.wrapperPath,timeoutMs:opts.timeoutMs,retryCount:opts.retryCount});
   if (!r.ok) return r;
   const p = extractJson(r.output);
-  if (!p.ok) return {ok:false,error:'JSON解析失败:'+p.error,raw:p.raw};
+  if (!p.ok) return {ok:false,error:'JSON解析失败:'+p.error,raw:p.raw,rawOutput:r.output};
   const v = validateCritique(p.data);
-  if (!v.ok) return {ok:false,error:'Critique校验失败',validationErrors:v.errors,data:p.data};
+  if (!v.ok) return {ok:false,error:'Critique校验失败',validationErrors:v.errors,data:p.data,rawOutput:r.output};
   return {ok:true,data:p.data,rawOutput:r.output,attempt:r.attempt};
 }
 

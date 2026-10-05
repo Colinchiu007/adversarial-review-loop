@@ -220,12 +220,15 @@ function blockingFromAdjudication(adj) {
 }
 
 // ---------- 回写 .ccg/reviews/<sha>.json ----------
+// 决策层可能还没有 commit（sha 为空），此时没有可回写的记录文件，静默跳过。
 function writeBack(sha, deepReview) {
+  if (!sha) return false;
   const f = path.join(REPO, ".ccg", "reviews", `${sha}.json`);
-  if (!fs.existsSync(f)) return;
+  if (!fs.existsSync(f)) return false;
   const rec = JSON.parse(fs.readFileSync(f, "utf8"));
   rec.deepReview = deepReview;
   fs.writeFileSync(f, JSON.stringify(rec, null, 2) + "\n", "utf8");
+  return true;
 }
 
 // ---------- 决策层：方案对抗评审（动手写码之前）----------
@@ -261,9 +264,11 @@ function runDecisionLayer(sha, proposalFile) {
   );
 
   const base = path.basename(proposalFile).replace(/\.[^.]+$/, "").toLowerCase();
+  // 决策层可能还没有任何 commit，slug 不能依赖 sha
+  const shortSha = sha ? sha.slice(0, 8) : "wip";
   const slug = engine.validateSlug("ccg-plan-" + base)
     ? "ccg-plan-" + base
-    : "ccg-plan-" + sha.slice(0, 8);
+    : "ccg-plan-" + shortSha;
   const dir = path.join(REPO, ".adversarial", slug);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -291,6 +296,7 @@ function runDecisionLayer(sha, proposalFile) {
       workdir: REPO,
       roundN: 1,
       proposalText: text,
+      dimensions: cfg.dimensions,
       wrapperPath: mc.DEFAULT_WRAPPER,
       timeoutMs: cfg.timeoutMs,
       retryCount: cfg.retryCount,
@@ -300,17 +306,38 @@ function runDecisionLayer(sha, proposalFile) {
     return 2;
   }
   if (!cr || !cr.ok) {
+    // 失败必须可诊断：打印校验明细 + 模型原始返回片段，
+    // 否则只能看到一句「Critique校验失败」，无法定位。
     console.error("评审失败: " + ((cr && cr.error) || "未知原因"));
+    if (cr && cr.validationErrors && cr.validationErrors.length) {
+      console.error("  校验错误:");
+      cr.validationErrors.slice(0, 8).forEach(function (e) { console.error("    - " + e); });
+    }
+    if (cr && cr.rawOutput) {
+      const snippet = String(cr.rawOutput).slice(0, 600);
+      console.error("  模型原始返回（前 600 字符）:");
+      console.error("    " + snippet.replace(/\n/g, "\n    "));
+    }
     return 2;
   }
 
   const critique = cr.data;
   engine.writeArtifact(dir, "critique-v1.md", JSON.stringify(critique, null, 2));
-  const scores = (critique.scores || []).map(function (s) { return s.score; });
-  const minScore = scores.length ? Math.min.apply(null, scores) : null;
-  const critCount = (critique.issues || []).length;
-  const critCritical = (critique.issues || []).filter(function (i) { return i.severity === "Critical"; }).length;
-  console.log(`  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），最低维度分 ${minScore}`);
+  // 维度分在 dimensionScores（对象：{维度: 1-10}），不是 scores 数组。
+  // 实测踩过：读 critique.scores 恒为 undefined，minScore 恒 null，
+  // 导致「分数达标 → cleared」这个分支永远进不去（死代码）。
+  const dimScores = critique.dimensionScores || {};
+  const dimValues = Object.keys(dimScores)
+    .map(function (k) { return dimScores[k]; })
+    .filter(function (v) { return typeof v === "number"; });
+  const minScore = dimValues.length ? Math.min.apply(null, dimValues) : null;
+  const critIssues = critique.issues || [];
+  const critCount = critIssues.length;
+  const critCritical = critIssues.filter(function (i) { return i.severity === "Critical"; }).length;
+  console.log(
+    `  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），` +
+      `最低维度分 ${minScore}（${Object.keys(dimScores).join("/")}）`
+  );
 
   // 决策层的收敛判定：出方案方尚未回应，因此只可能"继续"或"升级给人"，
   // 不存在"收敛"——收敛要等逐条回应之后。
@@ -353,17 +380,21 @@ function runDecisionLayer(sha, proposalFile) {
 
 // ---------- main ----------
 function main() {
+  // 决策层跑在动手写码之前，仓库可能一个 commit 都还没有，
+  // 因此 sha 不存在是正常状态，不能当成错误。
+  // 验证层才必须依赖 HEAD——它评审的是已落地的 diff。
   const sha = SHA || currentSha();
-  if (!sha) {
-    console.error("无法确定 sha");
+  const isDecisionLayer = !!PROPOSAL;
+  if (!sha && !isDecisionLayer) {
+    console.error("无法确定 sha（验证层需要 HEAD 才能取 diff，决策层不需要）");
     return 2;
   }
 
   // ══════════════════════════════════════════════════════════════
   //  决策层：--proposal <方案文件>  —— 动手写码之前
   // ══════════════════════════════════════════════════════════════
-  if (PROPOSAL) {
-    return runDecisionLayer(sha, PROPOSAL);
+  if (isDecisionLayer) {
+    return runDecisionLayer(sha || "", PROPOSAL);
   }
 
   // ══════════════════════════════════════════════════════════════
