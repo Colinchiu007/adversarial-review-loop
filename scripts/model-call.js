@@ -50,11 +50,41 @@ const DIMENSION_WHITELIST = ['completeness','consistency','clarity','feasibility
 const DECISION_WHITELIST = ['accepted','rejected','partially_accepted'];
 const EVIDENCE_WHITELIST = ['L1','L2','L3'];
 
+/**
+ * 从模型输出里抠出 JSON。
+ *
+ * ⚠ 必须区分「压根没有 JSON」和「JSON 被截断」——这两者的处置完全不同：
+ * 前者是模型没听话，后者是模型说得太多被 token 上限砍断，
+ * 而后者恰恰发生在"方案问题很多"的场合，也就是最需要拿到 critique 的时候。
+ *
+ * 实测踩到：critic 对一份方案产出 16+ 条问题，输出被截断在第 2 条中间，
+ * JSON.parse 失败，旧代码只报「无法提取有效JSON」——
+ * 看到这个报错完全猜不到是长度问题，只会反复重跑碰运气。
+ */
 function extractJson(text) {
-  try { return { ok: true, data: JSON.parse(text) }; } catch(e) {}
-  const m = text.match(/\{[\s\S]*\}/);
-  if (m) { try { return { ok: true, data: JSON.parse(m[0]) }; } catch(e) {} }
-  return { ok: false, error: '无法提取有效JSON', raw: text.substring(0,500) };
+  const s = String(text || '');
+  try { return { ok: true, data: JSON.parse(s) }; } catch (e) { /* 继续 */ }
+
+  const m = s.match(/\{[\s\S]*\}/);
+  if (m) {
+    try { return { ok: true, data: JSON.parse(m[0]) }; } catch (e) { /* 落到截断判定 */ }
+  }
+
+  // 截断特征：有对象起始但括号/引号不配平，或结尾没有收尾的 '}'
+  const opens = (s.match(/\{/g) || []).length;
+  const closes = (s.match(/\}/g) || []).length;
+  const startsJson = /^\s*\{/.test(s) || opens > 0;
+  const looksTruncated = startsJson && (opens !== closes || !/\}\s*$/.test(s.trim()));
+
+  return {
+    ok: false,
+    error: looksTruncated
+      ? '模型输出被截断，JSON 不完整（{' + opens + ' 个 { / ' + closes + ' 个 }，共 ' + s.length + ' 字符）'
+      : '无法提取有效JSON（输出中未找到可解析的 JSON）',
+    truncated: !!looksTruncated,
+    length: s.length,
+    raw: s.substring(0, 500),
+  };
 }
 
 // 近义/笔误字段名的窄白名单修复。
@@ -221,7 +251,18 @@ function callCritic(opts) {
   const r = callModel({backend:opts.backend,role:'critic',workdir:opts.workdir,taskPrompt:tp,wrapperPath:opts.wrapperPath,timeoutMs:opts.timeoutMs,retryCount:opts.retryCount});
   if (!r.ok) return r;
   const p = extractJson(r.output);
-  if (!p.ok) return {ok:false,error:'JSON解析失败:'+p.error,raw:p.raw,rawOutput:r.output};
+  if (!p.ok) {
+    const hint = p.truncated
+      ? ' —— 这通常意味着方案问题太多、模型输出超长被截断。' +
+        '重跑同样输入多半还是截断。可选：把方案拆小后分批评审，' +
+        '或先让 critic 只挑 Critical / Warning、暂不要求 Info。'
+      : '';
+    return {
+      ok: false, error: 'JSON解析失败:' + p.error + hint,
+      truncated: !!p.truncated, length: p.length,
+      raw: p.raw, rawOutput: r.output,
+    };
+  }
   // 先做窄白名单修复，再按「本次实际要求的维度」校验
   const norm = normalizeCritique(p.data);
   if (norm.repairs.length) {
