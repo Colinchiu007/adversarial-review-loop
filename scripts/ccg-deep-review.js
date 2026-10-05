@@ -66,6 +66,7 @@ function arg(name, dflt) {
 }
 const SHA = arg("--sha", "");
 const BASE = arg("--base", "origin/main");
+const BASE_EXPLICIT = process.argv.includes("--base");
 const PROPOSAL = arg("--proposal", ""); // 决策层：评审方案文档；缺省则评审 diff（验证层）
 const ALLOW_WHOLE_COMMIT = process.argv.includes("--allow-whole-commit");
 const DRY_RUN = process.argv.includes("--dry-run");
@@ -168,7 +169,13 @@ function readDecision(sha) {
 
 function currentSha() {
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    // stdio 静默：决策层跑在动手之前，仓库可能一个 commit 都还没有，
+    // 此时 git rev-parse HEAD 会往 stderr 打 fatal。
+    // 决策层本来就不需要 sha，不该把这种噪音糊到输出里。
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
   } catch (_) {
     return "";
   }
@@ -177,7 +184,20 @@ function currentSha() {
 // ---------- 变更基线回退链 ----------
 // 实测踩过：BASE 默认 origin/main，在没有 remote 的仓库里
 // `git diff origin/main...<sha>` 直接 fatal，proposal 退化成空，评审对象凭空消失。
+//
+// ⚠ 显式指定 --base 时只认它，不许回退。
+// 实测踩过：`--base <HEAD>`（本意是"这个 base 取不到就跳过"）被静默换成
+// HEAD~1，评审的根本不是要求的那个 diff。要么按你指定的来，要么明说取不到——
+// 悄悄换基线去评审另一段代码，比直接失败危险得多。
 function resolveBases(sha) {
+  if (BASE_EXPLICIT) {
+    try {
+      execFileSync("git", ["rev-parse", "--verify", BASE], { stdio: "ignore" });
+      return [BASE];
+    } catch (_) {
+      return [];
+    }
+  }
   const candidates = [`origin/${BASE}`, BASE, "HEAD~1", "HEAD"];
   const out = [];
   for (const b of candidates) {
@@ -687,8 +707,14 @@ function main() {
 
   const built = buildProposal(sha);
   if (!built) {
-    console.log("⏭ 取不到 diff（base..head 为空且未加 --allow-whole-commit）—— 退出 0");
-    console.log("   如确实要评审整个 commit，加 --allow-whole-commit");
+    if (BASE_EXPLICIT) {
+      console.log(`⏭ 显式指定的基线 ${BASE} 取不到 diff（不存在或 base..head 为空）—— 退出 0`);
+      console.log(`   显式指定的基线不会被自动替换：评审另一段 diff 比不评审更危险。`);
+      console.log(`   去掉 --base 可改用回退链（origin/${BASE} → ${BASE} → HEAD~1 → HEAD）。`);
+    } else {
+      console.log(`⏭ 取不到 diff（各候选基线的 base..head 均为空，且未加 --allow-whole-commit）—— 退出 0`);
+      console.log(`   如确实要评审整个 commit，加 --allow-whole-commit`);
+    }
     return 0;
   }
   if (built.mode === "whole-commit") {
@@ -696,6 +722,9 @@ function main() {
     console.log(`   评审体量可能远超预期；如需该行为请显式加 --allow-whole-commit`);
   } else {
     console.log(`变更基线: ${built.baseUsed}（${built.text.split("\n").length} 行）`);
+    if (!BASE_EXPLICIT && built.baseUsed !== BASE) {
+      console.log(`   （默认基线 ${BASE} 取不到 diff，已改用 ${built.baseUsed}）`);
+    }
   }
   const proposal = built.text;
   engine.writeArtifact(dir, "proposal-v1.md", proposal);
