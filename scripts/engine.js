@@ -66,10 +66,15 @@ function isStalled(rounds, cfg) {
 //   2. 置信度打折（默认 0.6）
 //   3. 高危域（auth / 加密 / 数据库迁移）的争议项不允许自扮演豁免，必须外部复核
 
+// 词表是实测补过的：初版只有 crypto/encrypt/secret 这类「库名」，
+// 真实 critic 描述的是「HMAC 签名校验长度不匹配时 return true，
+// fail-open 绕过」——一个词都不命中，于是 Critical 的加密缺陷
+// 被当成普通争议放进自扮演裁决，而设计要求高危域必须外部复核。
+// 补 signature/hmac/验签/重放 这类「行为词」后才拦得住。
 var HIGH_RISK_DOMAINS = [
-  { key: 'auth', label: '鉴权/授权', re: /(auth|login|logout|signin|signup|session|jwt|oauth|sso|permission|acl|rbac|csrf)/i },
-  { key: 'crypto', label: '加密/密钥', re: /(crypto|cipher|encrypt|decrypt|bcrypt|scrypt|argon2|pbkdf2|\bhash\b|salt|password|secret|private[_-]?key|credential|\baes\b|\brsa\b|\bdes\b|加密|解密|密钥|口令|密码|凭据)/i },
-  { key: 'datamigration', label: '数据库/迁移', re: /(migration|migrate|schema|alter[_\s]table|drop[_\s]table|backfill|数据迁移|建表|改表)/i }
+  { key: 'auth', label: '鉴权/授权', re: /(auth|login|logout|signin|signup|session|jwt|oauth|sso|permission|acl|rbac|csrf|\btoken\b|authenticat|authoriz|鉴权|授权|认证|越权|提权|登录态)/i },
+  { key: 'crypto', label: '加密/密钥', re: /(crypto|cipher|encrypt|decrypt|bcrypt|scrypt|argon2|pbkdf2|\bhash\b|salt|password|secret|private[_-]?key|credential|\baes\b|\brsa\b|\bdes\b|\bhmac\b|\bmd5\b|\bsha[\-_]?(1|224|256|384|512)\b|signature|signing|\bdigest\b|\bnonce\b|\breplay\b|加密|解密|密钥|口令|密码|凭据|签名|验签|摘要|重放|明文比较)/i },
+  { key: 'datamigration', label: '数据库/迁移', re: /(migration|migrate|schema|alter[_\s]table|drop[_\s]table|backfill|\bddl\b|\bdml\b|rollback|数据迁移|建表|改表|索引|回滚|唯一约束)/i }
 ];
 
 function classifyHighRisk(text) {

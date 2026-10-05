@@ -609,9 +609,22 @@ function main() {
     return 2;
   }
 
-  // 组装 task 并交给收敛决策
+  // 组装 task 并交给收敛决策。
+  //
+  // ⚠ currentRound 必须报成 maxRounds，不能报 1。
+  //
+  // 实测踩到的致命坑：验证层只跑一轮 critic，没有多轮循环，
+  // 但 task 写的是 currentRound:1、cfg.maxRounds=3。
+  // convergenceDecision 于是永远走不到 stall / maxRounds 分支，
+  // 每次都返回 {stop:false, reason:'continue'}，
+  // 驱动接着写 status="continue"、打印「✅ 无阻断」、exit 0——
+  // 一份 2 条 Critical、维度分 3/10 的 diff 就这么静默放行了，
+  // self_play / escalated 两个终态分支全是死代码。
+  //
+  // 诚实做法：单轮就是「轮次已耗尽」，直接走 maxRounds 分支，
+  // 让引擎自己去判 escalated（高危域）还是 self_play（可豁免域）。
   const task = {
-    currentRound: 1,
+    currentRound: cfg.maxRounds,
     rounds: [{
       round: 1, minScore: minScore, critique: critique,
       processed: { accepted: [], rejected: [], rejectedWithEvidence: [], partiallyAccepted: [] },
@@ -620,6 +633,18 @@ function main() {
 
   const d = engine.convergenceDecision(task, cfg);
   console.log(`\n收敛判定: status=${d.status} reason=${d.reason} minScore=${d.minScore}`);
+
+  // 兜底：引擎若返回非终态，绝不能当「无阻断」放行。
+  if (d.stop !== true) {
+    console.error("\n🔴 收敛判定返回非终态，按阻断处理（不允许把 continue 当通过）");
+    writeBack(sha, {
+      required: true, status: "escalated", performedBy: cfg.critic,
+      findings: critique.issues || [], minScore: minScore,
+      note: `收敛判定返回非终态 status=${d.status} reason=${d.reason}，保守升级给人`,
+      at: new Date().toISOString(),
+    });
+    return 1;
+  }
 
   if (d.status === "self_play") {
     const tplFile = writeAdjudicationTemplate(dir, d);
