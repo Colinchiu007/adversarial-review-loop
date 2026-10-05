@@ -18,9 +18,13 @@ function arlRolePrompt(role, backend) {
       claude: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个出方案方（Proposer）。产出结构化方案文档。只输出方案内容，不要寒暄。方案必须包含：背景与目标、方案设计、关键决策、边界与不做的事、风险与权衡。每个关键决策必须说明理由和替代方案。',
       opencode: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个出方案方（Proposer）。产出结构化方案文档。只输出方案内容，不要寒暄。方案必须包含：背景与目标、方案设计、关键决策、边界与不做的事、风险与权衡。每个关键决策必须说明理由和替代方案。'
     },
+    // 注意：这里绝不能写死维度名。决策层用 completeness/consistency/...，
+    // 验证层用 correctness/security/performance/maintainability，
+    // 写死会与任务提示里的实际维度打架——实测模型会照着系统提示返回
+    // 决策层维度，验证层校验直接判「未知维度」全盘失败。
     critic: {
-      claude: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个对抗评审员（Critic）。逐条挑刺，严格评审。必须输出严格JSON（不要Markdown代码块）。severity: Critical/Warning/Info。dimension: completeness/consistency/clarity/feasibility/security。每个issue必须有finding和suggestion。',
-      opencode: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个对抗评审员（Critic）。逐条挑刺，严格评审。必须输出严格JSON（不要Markdown代码块）。severity: Critical/Warning/Info。dimension: completeness/consistency/clarity/feasibility/security。每个issue必须有finding和suggestion。'
+      claude: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个对抗评审员（Critic）。逐条挑刺，严格评审。必须输出严格JSON（不要Markdown代码块）。severity: Critical/Warning/Info。dimension 与 dimensionScores 的维度名以任务提示中列出的那套为准，不要自行发挥。每个issue必须有finding和suggestion。',
+      opencode: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个对抗评审员（Critic）。逐条挑刺，严格评审。必须输出严格JSON（不要Markdown代码块）。severity: Critical/Warning/Info。dimension 与 dimensionScores 的维度名以任务提示中列出的那套为准，不要自行发挥。每个issue必须有finding和suggestion。'
     },
     rebutter: {
       claude: '不要使用任何工具（Glob/Grep/Bash/Read等），不要探索项目文件。直接输出你的回答。 你是一个方案辩护方（Rebutter）。逐条回应评审意见。必须输出严格JSON。decision: accepted/rejected/partially_accepted。rejected/partially_accepted必须附evidenceLevel(L1/L2/L3)和evidence。不要无证据拒绝。',
@@ -53,7 +57,54 @@ function extractJson(text) {
   return { ok: false, error: '无法提取有效JSON', raw: text.substring(0,500) };
 }
 
-function validateCritique(data) {
+// 近义/笔误字段名的窄白名单修复。
+// 为什么需要：真实模型会照着 prompt 输出，但会偶发手滑（实测抓到 "severge"）。
+// 这类错误是可确定性判定的一一映射，不是「放宽校验」——
+// 修完仍然进 validateCritique 走全套校验，缺字段照样拒。
+// 修复项一律回报给调用方打印，不静默。
+const FIELD_ALIASES = {
+  severge: 'severity',
+  severiy: 'severity',
+  severity_: 'severity',
+  dimention: 'dimension',
+  dimmension: 'dimension',
+  findings: 'finding',
+  suggestions: 'suggestion',
+};
+
+function normalizeCritique(data) {
+  const repairs = [];
+  if (!data || typeof data !== 'object') return { data: data, repairs: repairs };
+  if (!Array.isArray(data.issues)) return { data: data, repairs: repairs };
+  data.issues.forEach(function (iss, idx) {
+    if (!iss || typeof iss !== 'object') return;
+    Object.keys(FIELD_ALIASES).forEach(function (bad) {
+      if (!Object.prototype.hasOwnProperty.call(iss, bad)) return;
+      if (iss[FIELD_ALIASES[bad]] === undefined) {
+        iss[FIELD_ALIASES[bad]] = iss[bad];
+        repairs.push('issues[' + idx + '].' + bad + ' → ' + FIELD_ALIASES[bad]);
+      }
+      delete iss[bad];
+    });
+    // severity 大小写归一：prompt 要求 Critical/Warning/Info，模型常给小写
+    if (typeof iss.severity === 'string') {
+      const hit = SEVERITY_WHITELIST.find(function (s) {
+        return s.toLowerCase() === iss.severity.trim().toLowerCase();
+      });
+      if (hit && hit !== iss.severity) {
+        repairs.push('issues[' + idx + '].severity ' + iss.severity + ' → ' + hit);
+        iss.severity = hit;
+      }
+    }
+  });
+  return { data: data, repairs: repairs };
+}
+
+// dims 必须由调用方传入：决策层与验证层用两套不同的维度。
+// 曾经这里写死模块常量，导致验证层 100% 判「未知维度」——
+// prompt 要一套、校验查另一套，真实调用一次都跑不过。
+function validateCritique(data, dims) {
+  const allowedDims = dims || DIMENSION_WHITELIST;
   const errors = [];
   if (!data || typeof data !== 'object') { errors.push('数据不是对象'); return {ok:false,errors}; }
   if (!data.issues || !Array.isArray(data.issues)) errors.push('缺少issues数组');
@@ -62,7 +113,7 @@ function validateCritique(data) {
   if (data.issues) {
     data.issues.forEach(function(iss, idx) {
       if (!iss.severity || !SEVERITY_WHITELIST.includes(iss.severity)) errors.push('issues['+idx+'].severity无效:'+iss.severity);
-      if (!iss.dimension || !DIMENSION_WHITELIST.includes(iss.dimension)) errors.push('issues['+idx+'].dimension无效:'+iss.dimension);
+      if (!iss.dimension || !allowedDims.includes(iss.dimension)) errors.push('issues['+idx+'].dimension无效:'+iss.dimension);
       if (!iss.finding || !iss.finding.trim()) errors.push('issues['+idx+'].finding为空');
       if (!iss.suggestion || !iss.suggestion.trim()) errors.push('issues['+idx+'].suggestion为空');
       // id 必填：validateRebuttal / collectUnresolved / 自扮演裁决全靠 issue.id 做映射。
@@ -77,8 +128,13 @@ function validateCritique(data) {
     if (Object.keys(data.dimensionScores).length === 0) {
       errors.push('dimensionScores为空对象：无法判定是否达标，不视为通过');
     }
+    // dimensionScores 必须恰好覆盖本次要求的维度：少一个就判不出最低分，
+    // 多一个说明模型没按 prompt 走。两种都拦。
+    allowedDims.forEach(function (d) {
+      if (data.dimensionScores[d] === undefined) errors.push('缺少维度分:' + d);
+    });
     Object.keys(data.dimensionScores).forEach(function(k) {
-      if (!DIMENSION_WHITELIST.includes(k)) errors.push('未知维度:'+k);
+      if (!allowedDims.includes(k)) errors.push('未知维度:'+k);
       const v = data.dimensionScores[k];
       if (typeof v !== 'number' || v < 1 || v > 10) errors.push('维度分'+k+'无效:'+v);
     });
@@ -166,9 +222,15 @@ function callCritic(opts) {
   if (!r.ok) return r;
   const p = extractJson(r.output);
   if (!p.ok) return {ok:false,error:'JSON解析失败:'+p.error,raw:p.raw,rawOutput:r.output};
-  const v = validateCritique(p.data);
-  if (!v.ok) return {ok:false,error:'Critique校验失败',validationErrors:v.errors,data:p.data,rawOutput:r.output};
-  return {ok:true,data:p.data,rawOutput:r.output,attempt:r.attempt};
+  // 先做窄白名单修复，再按「本次实际要求的维度」校验
+  const norm = normalizeCritique(p.data);
+  if (norm.repairs.length) {
+    console.error('[critic] 契约字段修复 ' + norm.repairs.length + ' 处:');
+    norm.repairs.forEach(function (x) { console.error('  - ' + x); });
+  }
+  const v = validateCritique(norm.data, dims);
+  if (!v.ok) return {ok:false,error:'Critique校验失败',validationErrors:v.errors,data:norm.data,rawOutput:r.output,repairs:norm.repairs};
+  return {ok:true,data:norm.data,rawOutput:r.output,attempt:r.attempt,repairs:norm.repairs};
 }
 
 function callProposer(opts) {
@@ -200,6 +262,7 @@ function resolveBackends(preferred, available) {
 module.exports = {
   DEFAULT_WRAPPER, DEFAULT_TIMEOUT_MS, DEFAULT_RETRY_COUNT,
   arlRolePrompt, probeBackend, extractJson, validateCritique, validateRebuttal,
+  normalizeCritique, FIELD_ALIASES,
   callModel, callCritic, callProposer, callRebutter, resolveBackends,
   SEVERITY_WHITELIST, DIMENSION_WHITELIST, DECISION_WHITELIST, EVIDENCE_WHITELIST
 };
