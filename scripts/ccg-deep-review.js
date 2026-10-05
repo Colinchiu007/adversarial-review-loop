@@ -125,15 +125,35 @@ function currentSha() {
   }
 }
 
+// ---------- 变更基线回退链 ----------
+// 实测踩过：BASE 默认 origin/main，在没有 remote 的仓库里
+// `git diff origin/main...<sha>` 直接 fatal，proposal 退化成空，评审对象凭空消失。
+function resolveBases(sha) {
+  const candidates = [`origin/${BASE}`, BASE, "HEAD~1", "HEAD"];
+  const out = [];
+  for (const b of candidates) {
+    try {
+      execFileSync("git", ["rev-parse", "--verify", b], { stdio: "ignore" });
+      if (out.indexOf(b) < 0) out.push(b);
+    } catch (_) { /* 该基线不存在，试下一个 */ }
+  }
+  return out;
+}
+
 // ---------- 生成 proposal（把 diff 变成评审对象）----------
 function buildProposal(sha) {
   let diff = "";
-  try {
-    diff = execFileSync("git", ["diff", `${BASE}...${sha}`], {
-      encoding: "utf8",
-      maxBuffer: 32 * 1024 * 1024,
-    });
-  } catch (_) {
+  const bases = resolveBases(sha);
+  for (const b of bases) {
+    try {
+      const d = execFileSync("git", ["diff", `${b}...${sha}`], {
+        encoding: "utf8",
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      if (d && d.trim()) { diff = d; break; }
+    } catch (_) { /* 试下一个基线 */ }
+  }
+  if (!diff.trim()) {
     try {
       diff = execFileSync("git", ["show", sha], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
     } catch (_) {
@@ -141,10 +161,11 @@ function buildProposal(sha) {
     }
   }
   if (!diff.trim()) return null;
+  const usedBase = bases[0] || BASE;
   return [
     `# 变更提案（自动生成，待对抗评审）`,
     ``,
-    `- base: \`${BASE}\``,
+    `- base: \`${usedBase}\``,
     `- head: \`${sha}\``,
     `- 变更规模: ${diff.split("\n").length} 行 diff`,
     ``,
@@ -219,7 +240,32 @@ function blockingFromAdjudication(adj) {
   return blocking;
 }
 
-// ---------- 回写 .ccg/reviews/<sha>.json ----------
+/**
+ * 从 critique 里提取维度分。
+ *
+ * 契约：维度分在 dimensionScores（对象 {维度: 1-10}），不是 scores 数组。
+ * 踩过的坑：先在决策层读了 critique.scores，minScore 恒 null，
+ * 「分数达标 → cleared」成了死代码；修完决策层又忘了验证层，同一个 bug 复发。
+ * 所以这里抽成公共函数，两层共用，杜绝再分叉。
+ */
+function extractScores(critique) {
+  const dimScores = (critique && critique.dimensionScores) || {};
+  const values = Object.keys(dimScores)
+    .map((k) => dimScores[k])
+    .filter((v) => typeof v === "number");
+  return {
+    dimScores,
+    keys: Object.keys(dimScores),
+    values,
+    min: values.length ? Math.min.apply(null, values) : null,
+  };
+}
+
+/** 评审结果是否"可判定"：没有维度分就无法比较阈值，不能当作通过 */
+function isReviewDecidable(scores) {
+  return scores.values.length > 0 && scores.min !== null;
+}
+
 // 决策层可能还没有 commit（sha 为空），此时没有可回写的记录文件，静默跳过。
 function writeBack(sha, deepReview) {
   if (!sha) return false;
@@ -323,30 +369,27 @@ function runDecisionLayer(sha, proposalFile) {
 
   const critique = cr.data;
   engine.writeArtifact(dir, "critique-v1.md", JSON.stringify(critique, null, 2));
-  // 维度分在 dimensionScores（对象：{维度: 1-10}），不是 scores 数组。
-  // 实测踩过：读 critique.scores 恒为 undefined，minScore 恒 null，
-  // 导致「分数达标 → cleared」这个分支永远进不去（死代码）。
-  const dimScores = critique.dimensionScores || {};
-  const dimValues = Object.keys(dimScores)
-    .map(function (k) { return dimScores[k]; })
-    .filter(function (v) { return typeof v === "number"; });
-  const minScore = dimValues.length ? Math.min.apply(null, dimValues) : null;
+  const sc = extractScores(critique);
+  const minScore = sc.min;
   const critIssues = critique.issues || [];
   const critCount = critIssues.length;
-  const critCritical = critIssues.filter(function (i) { return i.severity === "Critical"; }).length;
+  const critCritical = critIssues.filter((i) => i.severity === "Critical").length;
   console.log(
     `  评审完成：${critCount} 条问题（其中 Critical ${critCritical}），` +
-      `最低维度分 ${minScore}（${Object.keys(dimScores).join("/")}）`
+      `最低维度分 ${minScore}（${sc.keys.join("/") || "无维度分"}）`
   );
 
-  // 决策层的收敛判定：出方案方尚未回应，因此只可能"继续"或"升级给人"，
-  // 不存在"收敛"——收敛要等逐条回应之后。
-  var hasCritical = critCritical > 0;
-  var verdict, verdictWhy;
-  if (hasCritical) {
+  // 决策层裁决：出方案方尚未回应，只可能"继续"或"升级"，不存在"收敛"
+  let verdict, verdictWhy;
+  if (critCritical > 0) {
     verdict = "blocked";
     verdictWhy = `评审方提出 ${critCritical} 条 Critical，必须由出方案方逐条回应（可拒绝但须给证据）后才能动手`;
-  } else if (minScore !== null && minScore >= (cfg.scoreThreshold || 8.0)) {
+  } else if (!isReviewDecidable(sc)) {
+    verdict = "incomplete";
+    verdictWhy =
+      "评审结果不完整（没有维度分），无法判定是否达标。" +
+      "重跑仍无维度分则需检查 critic 契约——不允许把这种结果当作通过";
+  } else if (minScore >= (cfg.scoreThreshold || 8.0)) {
     verdict = "cleared";
     verdictWhy = `无 Critical 且最低维度分 ${minScore} ≥ ${cfg.scoreThreshold}，方案可执行`;
   } else {
@@ -357,8 +400,11 @@ function runDecisionLayer(sha, proposalFile) {
   console.log(`\n决策层裁决: ${verdict}`);
   console.log(`  ${verdictWhy}`);
   console.log(`  产物: ${path.relative(REPO, dir)}（proposal-v1 / critique-v1 已配对落盘）`);
+
   if (verdict === "blocked") {
     console.log("  → 需在方案里逐条回应 Critical 后重跑本脚本，收敛才可动手");
+  } else if (verdict === "incomplete") {
+    console.log("  → 阻断：评审不完整不等于通过");
   } else if (verdict === "needs_revision") {
     console.log("  → 可动手，但建议按 critique 补强；补强后重跑会重新判定");
   }
@@ -370,7 +416,8 @@ function runDecisionLayer(sha, proposalFile) {
     performedBy: cfg.critic,
     objectType: "plan",
     minScore: minScore,
-    findings: critique.issues || [],
+    dimensionScores: sc.dimScores,
+    findings: critIssues,
     note: verdictWhy,
     artifacts: path.relative(REPO, dir),
     at: new Date().toISOString(),
@@ -466,6 +513,7 @@ function main() {
       workdir: REPO,
       roundN: 1,
       proposalText: proposal,
+      dimensions: cfg.dimensions,
       wrapperPath: mc.DEFAULT_WRAPPER,
       timeoutMs: cfg.timeoutMs,
       retryCount: cfg.retryCount,
@@ -490,10 +538,27 @@ function main() {
   }
   const critique = cr.data;
   engine.writeArtifact(dir, "critique-v1.md", JSON.stringify(critique, null, 2));
-  const scoreList = (critique.scores || []).map(function (s) { return s.score; });
-  const minScore = scoreList.length ? Math.min.apply(null, scoreList) : null;
-  console.log(`  评审完成：${(critique.issues || []).length} 条问题，` +
-              `${scoreList.length} 个维度，最低分 ${minScore}`);
+  // 与决策层共用 extractScores——同一个 bug 曾在两层各犯一次
+  const sc = extractScores(critique);
+  const minScore = sc.min;
+  console.log(
+    `  评审完成：${(critique.issues || []).length} 条问题，` +
+      `维度分 ${sc.keys.length} 个（${sc.keys.join("/") || "无"}），最低分 ${minScore}`
+  );
+
+  // 评审不完整（没有维度分）时不能进收敛决策——
+  // 实测踩过：minScore=null 被当成"没达标"，一路滑进 self_play，
+  // 把十几条问题挂成永远填不完的裁决模板，门禁看起来跑了实际什么都没判。
+  if (!isReviewDecidable(sc)) {
+    console.error("\n🔴 评审结果不完整：critique 没有维度分，无法判定是否达标");
+    console.error("   这不是「通过」。检查 critic 契约（dimensionScores 是否被要求并返回）后重试。");
+    writeBack(sha, {
+      required: true, status: "incomplete_review", performedBy: cfg.critic,
+      findings: critique.issues || null, note: "critique 缺少 dimensionScores，不视为通过",
+      artifacts: path.relative(REPO, dir), at: new Date().toISOString(),
+    });
+    return 2;
+  }
 
   // 组装 task 并交给收敛决策
   const task = {

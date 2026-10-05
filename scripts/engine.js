@@ -90,9 +90,32 @@ function collectUnresolved(lastRound) {
   (lastRound.processed && lastRound.processed.rejectedWithEvidence || []).forEach(function (r) { handled.add(String(r.issueId)); });
   (lastRound.processed && lastRound.processed.partiallyAccepted || []).forEach(function (r) { handled.add(String(r.issueId)); });
   var issues = (lastRound.critique && lastRound.critique.issues) || [];
-  return issues.filter(function (i) {
-    return !handled.has(String(i.id)) && (i.severity === 'Critical' || i.severity === 'Warning');
-  });
+
+  // id 兜底：模型可能不输出 id（validateCritique 现在会拦，但历史数据/自定义
+  // critique 仍可能缺）。用 finding 前 8 字的稳定哈希兜底，
+  // 否则裁决输出会变成「[Warning] undefined」且多条无法对应。
+  var idOf = function (i, idx) {
+    if (i.id !== undefined && i.id !== null && String(i.id).trim() !== '') return String(i.id).trim();
+    var seed = String(i.finding || ('issue-' + idx));
+    var h = 0;
+    for (var c = 0; c < seed.length; c++) { h = (h * 31 + seed.charCodeAt(c)) >>> 0; }
+    return 'auto-' + h.toString(36);
+  };
+
+  return issues
+    .map(function (i, idx) { return { issue: i, id: idOf(i, idx), idx: idx }; })
+    .filter(function (x) { return !handled.has(x.id) && (x.issue.severity === 'Critical' || x.issue.severity === 'Warning'); })
+    .map(function (x) { return x.issue; })
+    .map(function (i, idx) { return { issue: i, id: idOf(i, idx) }; })
+    .map(function (x) {
+      return {
+        id: x.id,
+        severity: x.issue.severity,
+        finding: x.issue.finding,
+        suggestion: x.issue.suggestion,
+        dimension: x.issue.dimension
+      };
+    });
 }
 
 /**

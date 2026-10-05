@@ -65,9 +65,18 @@ function validateCritique(data) {
       if (!iss.dimension || !DIMENSION_WHITELIST.includes(iss.dimension)) errors.push('issues['+idx+'].dimension无效:'+iss.dimension);
       if (!iss.finding || !iss.finding.trim()) errors.push('issues['+idx+'].finding为空');
       if (!iss.suggestion || !iss.suggestion.trim()) errors.push('issues['+idx+'].suggestion为空');
+      // id 必填：validateRebuttal / collectUnresolved / 自扮演裁决全靠 issue.id 做映射。
+      // 实测模型不输出 id 时，裁决会变成「[Warning] undefined」这样的垃圾，
+      // 而且多条 issue 无法相互对应。这里从源头拦住。
+      if (iss.id === undefined || iss.id === null || String(iss.id).trim() === '') {
+        errors.push('issues['+idx+'].id为空');
+      }
     });
   }
   if (data.dimensionScores) {
+    if (Object.keys(data.dimensionScores).length === 0) {
+      errors.push('dimensionScores为空对象：无法判定是否达标，不视为通过');
+    }
     Object.keys(data.dimensionScores).forEach(function(k) {
       if (!DIMENSION_WHITELIST.includes(k)) errors.push('未知维度:'+k);
       const v = data.dimensionScores[k];
@@ -132,7 +141,8 @@ function callCritic(opts) {
     '{',
     '  "schemaVersion": 1,',
     '  "issues": [',
-    '    { "severity": "Critical|Warning|Info",',
+    '    { "id": "唯一短标识，如 i1、i2",',
+    '      "severity": "Critical|Warning|Info",',
     '      "dimension": "' + dims.join('|') + '",',
     '      "finding": "具体问题，必须可验证",',
     '      "suggestion": "具体改法" }',
@@ -144,7 +154,8 @@ function callCritic(opts) {
     '',
     'severity 只能是 Critical / Warning / Info 三选一；',
     'dimension 只能是上面列出的维度之一；',
-    '每个维度都要在 dimensionScores 里给出 1-10 分；',
+    '每条 issue 必须有唯一的短 id（i1、i2…），后续回应要按 id 引用，不能省；',
+    '每个维度都要在 dimensionScores 里给出 1-10 分，dimensionScores 不能是空对象；',
     '没有问题时 issues 给空数组，但仍必须给出全部维度的分数。',
   ].join('\n');
 
