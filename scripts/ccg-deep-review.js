@@ -69,6 +69,13 @@ const BASE = arg("--base", "origin/main");
 const PROPOSAL = arg("--proposal", ""); // 决策层：评审方案文档；缺省则评审 diff（验证层）
 const ALLOW_WHOLE_COMMIT = process.argv.includes("--allow-whole-commit");
 const DRY_RUN = process.argv.includes("--dry-run");
+
+// ---------- 模块级状态（集中在顶部，避免声明散落在使用点之后）----------
+// 当前生效的判定记录文件路径。readDecision 命中 diff 内容寻址时，
+// 记录在【父 sha】名下；writeBack 必须写回同一个文件，否则整轮结论被丢弃。
+let ACTIVE_RECORD_FILE = null;
+// 裁决未填完时的摘要，供 main 打印「还差哪几条」
+let ADJ_INCOMPLETE = null;
 const REPO = process.cwd();
 
 // ---------- 家族映射（与 references/family-check.md 保持一致）----------
@@ -119,11 +126,12 @@ function cfgForMode(mode) {
 // commit，tree 因此移位，键对不上——实测踩过。
 function readDecision(sha) {
   const dir = path.join(REPO, ".ccg", "reviews");
+  ACTIVE_RECORD_FILE = null;
   const f = path.join(dir, `${sha}.json`);
   if (fs.existsSync(f)) {
     try {
       const r = JSON.parse(fs.readFileSync(f, "utf8"));
-      r._recordFile = path.join(".ccg", "reviews", `${sha}.json`);
+      ACTIVE_RECORD_FILE = f;
       return r;
     } catch (_) { /* 落到 diff 哈希寻址 */ }
   }
@@ -149,6 +157,7 @@ function readDecision(sha) {
       rec = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
     } catch (_) { continue; }
     if (rec && rec.stagedDiffHash && rec.stagedDiffHash === want) {
+      ACTIVE_RECORD_FILE = path.join(dir, n);
       rec._recordFile = path.join(".ccg", "reviews", n);
       rec._matchedBy = "stagedDiffHash";
       return rec;
@@ -246,8 +255,65 @@ function wrapProposal(sha, base, body, mode) {
 
 // ---------- 自扮演裁决模板 ----------
 // 脚本不代替 LLM 裁决，只把待裁决清单落成可填的结构，由 agent/评审人填写。
-function writeAdjudicationTemplate(dir, decision) {
+// 裁决必须绑定它所裁决的那份 critique。
+// 不绑定就会出现：重跑深度审查 → 模型这次给 6 条、上次给 5 条 →
+// 模板仍是旧的 5 条 → agent 照着旧模板填完 → 裁决被套用到
+// 完全不同的问题集上，而 blockingFromAdjudication 只认模板自己的 items，
+// 不会有任何报错。实测踩到（模板 5 条 / critique 6 条）。
+function critiqueFingerprint(critique) {
+  const issues = (critique && critique.issues) || [];
+  return require("crypto")
+    .createHash("sha256")
+    .update(JSON.stringify(issues.map((i) => [i.id, i.severity, i.finding])))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+// 读回上一轮存档的 critique（critique-v1.md 存的就是 JSON）
+function readStoredCritique(dir) {
+  const f = path.join(dir, "critique-v1.md");
+  if (!fs.existsSync(f)) return null;
+  try {
+    const c = JSON.parse(fs.readFileSync(f, "utf8"));
+    return c && Array.isArray(c.issues) ? c : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 依据已填写的裁决落最终结论（复用电裁决与正常流程共用同一段逻辑） */
+function finalizeAdjudication(sha, dir, cfg, adj) {
+  const blocking = blockingFromAdjudication(adj);
+  writeBack(sha, {
+    required: true,
+    status: blocking.length ? "self_play_blocked" : "self_play_resolved",
+    performedBy: "self-play",
+    confidenceWeight: adj.confidenceWeight,
+    requiresExternalReview: adj.requiresExternalReview,
+    findings: adj.items,
+    blocking: blocking,
+    note: blocking.length
+      ? `自扮演裁决：${blocking.length} 条指控成立或需外部复核`
+      : "自扮演裁决：全部指控不成立",
+    at: new Date().toISOString(),
+  });
+  if (blocking.length) {
+    console.log(`\n🔴 自扮演裁决判定存在阻断项 ${blocking.length} 条`);
+    blocking.forEach(function (b) {
+      console.log(`   - [${b.severity || "-"}] ${b.id}  ${b.reason}`);
+    });
+    return 1;
+  }
+  console.log(`\n✅ 自扮演裁决未发现阻断项`);
+  return 0;
+}
+
+function writeAdjudicationTemplate(dir, decision, critique) {
   const sp = decision.selfPlay;
+  const f = path.join(dir, "adjudication.json");
+  // 已有裁决文件就别覆盖：否则每次重跑都会把 agent 填好的 verdict 冲成 null，
+  // 裁决等于从来没发生过。
+  if (fs.existsSync(f)) return f;
   const tpl = {
     schemaVersion: 1,
     adjudicatedBy: "self-play",
@@ -255,6 +321,7 @@ function writeAdjudicationTemplate(dir, decision) {
     reason: "stall/maxRounds 后自扮演裁决（引擎第三档出口）",
     highRiskNote: "高危域争议项不允许自扮演豁免，必须外部复核",
     requiresExternalReview: sp.requiresExternalReview,
+    critiqueFingerprint: critiqueFingerprint(critique),
     instructions: [
       "对 items 里每一条争议，依次生成：",
       "  1) 最强指控 —— 论证这条确实是真问题（含具体失败场景）",
@@ -273,20 +340,50 @@ function writeAdjudicationTemplate(dir, decision) {
       rationale: null,   // 裁决理由
     })),
   };
-  const f = path.join(dir, "adjudication.json");
   fs.writeFileSync(f, JSON.stringify(tpl, null, 2) + "\n", "utf8");
   return f;
 }
 
 // ---------- 读取已填写的裁决 ----------
-function readAdjudication(dir) {
+//
+// ⚠ 只认「真的填完了、且对应当前 critique」的裁决。
+// 驱动会先 writeAdjudicationTemplate() 落一个 verdict 全 null 的空模板，
+// 紧接着 readAdjudication() 读的就是它自己刚写的那个文件。
+// 若不校验填写状态，blockingFromAdjudication() 会算出空数组，
+// 于是「没人裁决」被当成「全部不成立」→ self_play_resolved + exit 0，
+// 5 条未解决争议（含 Critical）零输入静默放行。实测踩过。
+// 与「continue 当通过」是同一类错误：未完成不等于通过。
+function readAdjudication(dir, critique) {
   const f = path.join(dir, "adjudication.json");
   if (!fs.existsSync(f)) return null;
+  let adj;
   try {
-    return JSON.parse(fs.readFileSync(f, "utf8"));
+    adj = JSON.parse(fs.readFileSync(f, "utf8"));
   } catch (_) {
     return null;
   }
+
+  const want = critiqueFingerprint(critique);
+  if (adj.critiqueFingerprint && adj.critiqueFingerprint !== want) {
+    ADJ_INCOMPLETE = { total: 0, pending: 0, ids: [], stale: true, oldFp: adj.critiqueFingerprint, newFp: want };
+    return null;
+  }
+
+  const items = (adj && adj.items) || [];
+  if (!items.length) return null;
+  const unfilled = items.filter(
+    (i) => i.verdict !== "upheld" && i.verdict !== "dismissed"
+  );
+  if (unfilled.length) {
+    ADJ_INCOMPLETE = {
+      total: items.length,
+      pending: unfilled.length,
+      ids: unfilled.map((i) => i.id),
+      stale: false,
+    };
+    return null;
+  }
+  return adj;
 }
 
 /** 依据裁决结果算出最终阻断项 */
@@ -332,14 +429,36 @@ function isReviewDecidable(scores) {
 }
 
 // 决策层可能还没有 commit（sha 为空），此时没有可回写的记录文件，静默跳过。
+// 整轮深度审查的结论必须落回「读到的那份记录」：
+// readDecision 命中 diff 内容寻址时，记录在【父 sha】名下，
+// 若 writeBack 仍按 <本次 sha>.json 去找，找不到就静默 return false，
+// 跑了 3 分钟、花了 token 的结论被丢弃——实测踩过：
+// 记录里 deepReview.status 一直是 pending。
 function writeBack(sha, deepReview) {
   if (!sha) return false;
-  const f = path.join(REPO, ".ccg", "reviews", `${sha}.json`);
-  if (!fs.existsSync(f)) return false;
-  const rec = JSON.parse(fs.readFileSync(f, "utf8"));
+  const dir = path.join(REPO, ".ccg", "reviews");
+  const f = ACTIVE_RECORD_FILE || path.join(dir, `${sha}.json`);
+  fs.mkdirSync(dir, { recursive: true });
+  let rec = {};
+  if (fs.existsSync(f)) {
+    try {
+      rec = JSON.parse(fs.readFileSync(f, "utf8"));
+    } catch (_) {
+      rec = {};
+    }
+  } else {
+    // 找不到就新建，绝不静默丢结论
+    rec = { sha: sha, layer: "diff", decidedBy: "ccg-review-decider" };
+    console.log(`   判定记录不存在，已新建: ${path.relative(REPO, f)}`);
+  }
   rec.deepReview = deepReview;
-  fs.writeFileSync(f, JSON.stringify(rec, null, 2) + "\n", "utf8");
-  return true;
+  try {
+    fs.writeFileSync(f, JSON.stringify(rec, null, 2) + "\n", "utf8");
+    return true;
+  } catch (e) {
+    console.error("判定结果落盘失败（本次结论仅存在于终端输出）: " + e.message);
+    return false;
+  }
 }
 
 // ---------- 决策层：方案对抗评审（动手写码之前）----------
@@ -581,6 +700,56 @@ function main() {
   const proposal = built.text;
   engine.writeArtifact(dir, "proposal-v1.md", proposal);
 
+  // ── 存档 critique 复用短路 ──────────────────────────────────────
+  // 驱动每次运行都会重新调 critic，而模型每次给的 critique 不一样。
+  // 于是「填好裁决 → 重跑」根本走不通：指纹一变旧裁决当场作废，
+  // 每填一次就得再等一轮 3 分钟评审。
+  //
+  // 正解：只要存档 critique 还在，裁决状态就该基于它来判断，不要重评：
+  //   已填完且指纹匹配 → 直接出裁决结论，零模型调用
+  //   指纹匹配但没填完 → 记 pending，同样零模型调用
+  //     （否则每填一次裁决都要先等一轮评审，正是自扮演要消除的耗时）
+  //   指纹不匹配        → 旧裁决作废，才值得重新评审
+  const storedCrit = readStoredCritique(dir);
+  if (storedCrit) {
+    ADJ_INCOMPLETE = null;
+    const ready = readAdjudication(dir, storedCrit);
+    if (ready) {
+      console.log(`\n♻ 复用存档 critique（${storedCrit.issues.length} 条）+ 已填完的裁决 —— 跳过模型调用`);
+      return finalizeAdjudication(sha, dir, cfg, ready);
+    }
+    if (ADJ_INCOMPLETE && ADJ_INCOMPLETE.stale) {
+      console.log(`\n⚠ 现有裁决对应的是上一轮 critique，已作废，将重新评审`);
+    } else if (ADJ_INCOMPLETE) {
+      // 存档 critique 仍然有效，只是裁决没填完 → 不重评，直接 pending
+      const sc = extractScores(storedCrit);
+      if (isReviewDecidable(sc)) {
+        const task = {
+          currentRound: cfg.maxRounds,
+          rounds: [{ round: 1, minScore: sc.min, critique: storedCrit,
+            processed: { accepted: [], rejected: [], rejectedWithEvidence: [], partiallyAccepted: [] } }],
+        };
+        const dStored = engine.convergenceDecision(task, cfg);
+        if (dStored.status === "self_play") {
+          const tpl = path.join(dir, "adjudication.json");
+          console.log(`\n♻ 复用存档 critique（${storedCrit.issues.length} 条，最低分 ${sc.min}）—— 裁决未填完，跳过模型调用`);
+          writeBack(sha, {
+            required: true, status: "self_play_pending", performedBy: "self-play(pending)",
+            confidenceWeight: dStored.selfPlay.confidenceWeight,
+            requiresExternalReview: dStored.selfPlay.requiresExternalReview,
+            findings: null, template: path.relative(REPO, tpl),
+            note: `裁决尚未填写：${ADJ_INCOMPLETE.pending}/${ADJ_INCOMPLETE.total} 条未定（${ADJ_INCOMPLETE.ids.join(", ")}）`,
+            at: new Date().toISOString(),
+          });
+          console.log(`   待填: ${ADJ_INCOMPLETE.ids.join(", ")}`);
+          console.log(`\n裁决未填写 —— 本次不判定阻断，状态记为 self_play_pending`);
+          return 0;
+        }
+      }
+      // 存档 critique 判不出终态（无维度分等），退回重新评审
+    }
+  }
+
   // 跑第一轮：评审方挑刺
   console.log(`\n[轮 1/${cfg.maxRounds}] 调用 critic=${cfg.critic} 评审...`);
   let cr;
@@ -690,40 +859,39 @@ function main() {
   }
 
   if (d.status === "self_play") {
-    const tplFile = writeAdjudicationTemplate(dir, d);
+    const tplFile = writeAdjudicationTemplate(dir, d, critique);
     console.log(`\n⚡ 进入自扮演裁决（引擎第三档出口）`);
     console.log(`   置信权重 ${d.selfPlay.confidenceWeight}（低于真跨家族 ${1.0}）`);
     console.log(`   待裁决 ${d.selfPlay.items.length} 条；其中高危域必须外部复核 ${d.selfPlay.requiresExternalReview.length} 条`);
     console.log(`   裁决模板已生成: ${path.relative(REPO, tplFile)}`);
     console.log(`   → 由 agent 逐条填 prosecution / defense / verdict / rationale`);
 
-    const adj = readAdjudication(dir);
+    const adj = readAdjudication(dir, critique);
     if (!adj) {
       writeBack(sha, {
         required: true, status: "self_play_pending", performedBy: "self-play(pending)",
         confidenceWeight: d.selfPlay.confidenceWeight,
         requiresExternalReview: d.selfPlay.requiresExternalReview,
         findings: null, template: path.relative(REPO, tplFile),
+        note: ADJ_INCOMPLETE && ADJ_INCOMPLETE.stale
+          ? `裁决对应的 critique 已变（指纹 ${ADJ_INCOMPLETE.oldFp} → ${ADJ_INCOMPLETE.newFp}），旧裁决作废`
+          : (ADJ_INCOMPLETE
+            ? `裁决尚未填写：${ADJ_INCOMPLETE.pending}/${ADJ_INCOMPLETE.total} 条未定（${ADJ_INCOMPLETE.ids.join(", ")}）`
+            : "裁决尚未填写"),
         at: new Date().toISOString(),
       });
+      if (ADJ_INCOMPLETE && ADJ_INCOMPLETE.stale) {
+        console.log(`\n⚠ 现有裁决对应的是上一轮 critique，已作废`);
+        console.log(`   指纹 ${ADJ_INCOMPLETE.oldFp} → ${ADJ_INCOMPLETE.newFp}`);
+        console.log(`   请按本轮 critique 重新裁决后覆盖 ${path.relative(REPO, tplFile)}`);
+      } else if (ADJ_INCOMPLETE) {
+        console.log(`\n⚠ 裁决未填写完整：${ADJ_INCOMPLETE.pending}/${ADJ_INCOMPLETE.total} 条仍无 verdict`);
+        console.log(`   待填: ${ADJ_INCOMPLETE.ids.join(", ")}`);
+      }
       console.log(`\n裁决未填写 —— 本次不判定阻断，状态记为 self_play_pending`);
       return 0;
     }
-    const blocking = blockingFromAdjudication(adj);
-    writeBack(sha, {
-      required: true, status: blocking.length ? "self_play_blocked" : "self_play_resolved",
-      performedBy: "self-play", confidenceWeight: adj.confidenceWeight,
-      requiresExternalReview: adj.requiresExternalReview,
-      findings: adj.items, blocking: blocking,
-      at: new Date().toISOString(),
-    });
-    if (blocking.length) {
-      console.log(`\n🔴 自扮演裁决判定存在阻断项 ${blocking.length} 条`);
-      blocking.forEach(function (b) { console.log(`   - [${b.severity}] ${b.id}  ${b.reason}`); });
-      return 1;
-    }
-    console.log(`\n✅ 自扮演裁决未发现阻断项`);
-    return 0;
+    return finalizeAdjudication(sha, dir, cfg, adj);
   }
 
   if (d.status === "escalated") {
