@@ -14,6 +14,11 @@ const DEFAULT_RETRY_COUNT = 2;
 // 退避基数（毫秒）。多轮循环里 critic 与 proposer 是背靠背连发，
 // 失败后立刻硬打很容易连撞 provider 限流，越打越死。
 const RETRY_BACKOFF_MS = 8000;
+// critic 单次最多提多少条问题。
+// 为什么要限：实测 critic 给「单条」issue 写超长 finding，输出撞上限被截断，
+// 整轮作废——而且截断在最需要 critique 的时刻发生（问题多时）。
+// 数字可调；宁少勿长。
+const MAX_CRITIC_ISSUES = 8;
 
 /**
  * 各后端的输入长度上限（字符数）。超限会被后端**同步拒绝**。
@@ -364,6 +369,13 @@ function callCritic(opts) {
     '每条 issue 必须有唯一的短 id（i1、i2…），后续回应要按 id 引用，不能省；',
     '每个维度都要在 dimensionScores 里给出 1-10 分，dimensionScores 不能是空对象；',
     '没有问题时 issues 给空数组，但仍必须给出全部维度的分数。',
+    '',
+    '⚠ 长度纪律（超了整轮作废，不是你写得不好，是接口装不下）：',
+    '· issues 最多 ' + MAX_CRITIC_ISSUES + ' 条，按严重度从高到低排，重要的排前面；',
+    '· 单条 finding 不超过 150 字，suggestion 不超过 80 字；',
+    '· 要点用短句，不要复述方案原文，不要写长篇论证；',
+    '· 宁可少提一条，也不要把一条写成一段论文——',
+    '  实测有过 critic 给单条 issue 写超长 finding，输出直接撞上限被截断，整轮白跑。',
   ].join('\n');
 
   var tp = '请评审以下方案（第' + opts.roundN + '轮）：\n\n' + opts.proposalText
