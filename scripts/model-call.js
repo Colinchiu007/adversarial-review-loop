@@ -381,9 +381,34 @@ function callCritic(opts) {
   var tp = '请评审以下方案（第' + opts.roundN + '轮）：\n\n' + opts.proposalText
     + '\n\n' + schemaHint + '\n\n请输出JSON格式的评审结果。';
 
-  const r = callModel({backend:opts.backend,role:'critic',workdir:opts.workdir,taskPrompt:tp,wrapperPath:opts.wrapperPath,timeoutMs:opts.timeoutMs,retryCount:opts.retryCount});
+  // 解析失败可以重试：这类失败是随机的，不重试等于白白丢掉一次评审。
+  // 实测：第 2 轮 critic 只吐了 91 字符就停了（`{"schemaVersion":1,"issues":[`），
+  // 不是内容装不下，是模型自己中断——重跑通常就正常。
+  //
+  // 但要区分：输出已经很长的截断（内容装不下）重试没有意义，
+  // 只在"输出本来就短"的情况下重试。
+  let r = null;
+  let p = null;
+  const parseRetries = (opts && opts.parseRetries !== undefined) ? opts.parseRetries : 1;
+  for (let pr = 0; pr <= parseRetries; pr++) {
+    r = callModel({
+      backend: opts.backend, role: 'critic', workdir: opts.workdir,
+      taskPrompt: tp, wrapperPath: opts.wrapperPath,
+      timeoutMs: opts.timeoutMs, retryCount: opts.retryCount,
+    });
+    if (!r.ok) break;
+    p = extractJson(r.output);
+    if (p.ok) break;
+    const short = p.length < 4000;
+    if (pr < parseRetries && short) {
+      console.error('[critic] 输出解析失败且内容很短（' + p.length +
+        ' 字符），判定为模型中断而非内容装不下 —— 重试一次');
+      sleepMs(RETRY_BACKOFF_MS);
+      continue;
+    }
+    break;
+  }
   if (!r.ok) return r;
-  const p = extractJson(r.output);
   if (!p.ok) {
     const hint = p.truncated
       ? ' —— 这通常意味着方案问题太多、模型输出超长被截断。' +
@@ -434,6 +459,24 @@ function callCritic(opts) {
  *  5. decision 为 accepted / partially_accepted 的 issue，必须至少有一处 edit
  *     —— 说了"我改"却没给改动，方案原封不动，循环不可能收敛
  */
+/**
+ * before 的落点是否在 ```diff 代码块内部。
+ *
+ * 为什么必须拦：方案里的 ```diff 块是【示意性的】，不是真正要执行的补丁。
+ * 改了它，方案里的 diff 会被替换成零散片段，读起来不再是 diff。
+ * 实测踩过：模型被要求"逐字复制"时会去 diff 块里抓行，连 + / - / 前导空格
+ * 一起复制——那种 before 按字面是"存在于原文"的（所以逐字校验拦不住），
+ * 但应用之后 illustrative diff 就毁了。所以要按【落点】判断，而不是按字符形状。
+ */
+function indexInsideDiffFence(plan, index) {
+  const before = plan.slice(0, index);
+  const open = before.lastIndexOf('```');
+  if (open < 0) return false;
+  // 最后一个 ``` 之后如果紧跟着 diff（可带空格/语言标记），说明落点在 diff 块里
+  const tail = before.slice(open + 3).trim();
+  return /^diff\b/i.test(tail);
+}
+
 function validateRevision(data, critique, planText) {
   const errors = [];
   if (!data || typeof data !== 'object') return { ok: false, errors: ['数据不是对象'] };
@@ -466,11 +509,26 @@ function validateRevision(data, critique, planText) {
         return;
       }
       if (!plan) return; // 无 planText 时跳过存在性校验（单元测试可只测结构）
-      const hits = plan.split(ed.before).length - 1;
+      const at = plan.indexOf(ed.before);
+      const hits = at < 0 ? 0 : plan.split(ed.before).length - 1;
       if (hits === 0) {
+        // 没找到：区分两种病因，给针对性提示
+        const looksHunk = /^[+\-]/.test(ed.before) || ed.before !== ed.before.trimStart();
         errors.push('edits[' + idx + ']before 在方案原文中不存在（逐字匹配失败）：' +
-          JSON.stringify(ed.before.slice(0, 40)));
-      } else if (hits > 1) {
+          JSON.stringify(ed.before.slice(0, 40)) +
+          (looksHunk
+            ? '。它带着 diff 标记（+ / - / 前导空格）——请从方案的【散文段落】' +
+              '逐字复制，不要从 ```diff 代码块里复制'
+            : ''));
+        return;
+      }
+      if (indexInsideDiffFence(plan, at)) {
+        errors.push('edits[' + idx + ']before 落在方案的 ```diff 代码块内部：' +
+          JSON.stringify(ed.before.slice(0, 40)) +
+          '。diff 块是示意性的，改它只会毁掉示意；请改为修改它上下的【散文说明】');
+        return;
+      }
+      if (hits > 1) {
         errors.push('edits[' + idx + ']before 在方案原文中出现 ' + hits +
           ' 次，无法唯一定位，请给出更长的上下文：' + JSON.stringify(ed.before.slice(0, 40)));
       }
@@ -618,6 +676,9 @@ function callReviser(opts) {
     'edits 是【外科式改动】，不是重写全文——这是硬性要求：',
     '  · 只给需要真正改动的地方，不要把整份方案重写一遍；',
     '  · before 必须从上面的方案里【逐字复制】，一个字都不能改（包括标点与缩进）；',
+    '  · before 必须从方案的【散文段落】复制——不要从 ```diff 代码块里复制，',
+    '    那会把 + / - / 前导空格这些 diff 标记一起带进来，永远对不上原文；',
+    '    要改 diff 块所描述的内容，就改它上下的说明文字；',
     '  · before 在方案全文中必须只出现一次；不唯一就多带几行上下文把它变唯一；',
     '  · 一处改动一个 edit，不要把不相关的改动合并进同一个 before；',
     '  · decision 为 accepted / partially_accepted 的问题必须至少有一处对应的 edit；',
