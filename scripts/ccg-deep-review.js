@@ -593,6 +593,16 @@ function runDecisionLayer(sha, proposalFile) {
   let minScore = null;
   let critCritical = 0;
   let stoppedBy = "converged";
+  // 分数回退止损。
+  // 实测踩到：轮1 最低分 7，应用 5 处改动后轮2 掉到 5——
+  // proposer 看不见全局，改完把方案弄得更糟，而循环毫无察觉地继续往下走。
+  // 引擎的验证层有 isStalled 止损，决策层原先没有对等机制，这里补上：
+  // 一旦某轮比历史最好分更差，回滚到最好的那份并停止。
+  // 不继续跑的理由：同一个 proposer 用同样的方式再改一轮，大概率还是更差。
+  let bestText = planText;
+  let bestMinScore = null;
+  let regressedBestRound = 0;
+  let regressedFrom = null;
 
   for (let round = 1; round <= maxRounds; round++) {
     engine.writeArtifact(dir, `proposal-v${round}.md`, planText);
@@ -661,6 +671,25 @@ function runDecisionLayer(sha, proposalFile) {
     if (!isReviewDecidable(sc)) {
       stoppedBy = "incomplete";
       break;
+    }
+
+    // 分数回退检测：必须放在「是否需要下一轮」判断之前。
+    // 否则一轮把分数改低的改动会被当成有效修订接受下来。
+    if (bestMinScore !== null && minScore < bestMinScore) {
+      regressedFrom = { round: round, got: minScore, best: bestMinScore, bestRound: regressedBestRound };
+      console.log(
+        `  ⚠ 分数回退：本轮 ${minScore} < 历史最好 ${bestMinScore}（第 ${regressedBestRound} 轮）` +
+          ` —— 回滚到最好的一版并停止`
+      );
+      planText = bestText;
+      minScore = bestMinScore;
+      stoppedBy = "regressed";
+      break;
+    }
+    if (bestMinScore === null || minScore > bestMinScore) {
+      bestMinScore = minScore;
+      bestText = planText;
+      regressedBestRound = round;
     }
     // 唯一放行条件
     if (critCritical === 0 && minScore >= threshold) {
@@ -772,7 +801,10 @@ function runDecisionLayer(sha, proposalFile) {
     verdict = "needs_revision";
     verdictWhy =
       `跑满 ${maxRounds} 轮无 Critical 但最低维度分仍为 ${minScore} < ${threshold}；` +
-      (stoppedBy === "no_revision" ? "且修订稿与原方案无差异，自动循环已无法推进" : "建议继续补强");
+      (stoppedBy === "no_revision" ? "且修订稿与原方案无差异，自动循环已无法推进" :
+        stoppedBy === "regressed"
+          ? `且第 ${regressedFrom.round} 轮把分数从 ${regressedFrom.best} 改低到 ${regressedFrom.got}，已回滚到最好的一版`
+          : "建议继续补强");
   }
 
   console.log(`\n── 多轮轨迹 ──`);
@@ -783,6 +815,14 @@ function runDecisionLayer(sha, proposalFile) {
     );
   });
   console.log(`  停止原因: ${stoppedBy}`);
+  if (stoppedBy === "regressed") {
+    console.log(
+      `  最好的一版: 第 ${regressedBestRound} 轮，最低分 ${bestMinScore}` +
+        `（第 ${regressedFrom.round} 轮改到 ${regressedFrom.got}，已回滚）`
+    );
+    console.log(`  回滚后的方案已写回 ${path.relative(REPO, dir)}/plan-reverted.md`);
+    engine.writeArtifact(dir, "plan-reverted.md", planText);
+  }
 
   console.log(`\n决策层裁决: ${verdict}`);
   console.log(`  ${verdictWhy}`);

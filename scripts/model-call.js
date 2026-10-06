@@ -439,7 +439,11 @@ function validateRevision(data, critique, planText) {
   if (!data || typeof data !== 'object') return { ok: false, errors: ['数据不是对象'] };
   if (data.schemaVersion === undefined) errors.push('缺少schemaVersion');
   if (!Array.isArray(data.responses)) errors.push('缺少responses数组');
-  if (!Array.isArray(data.edits) || data.edits.length === 0) errors.push('缺少edits数组（不能是空数组）');
+  if (!Array.isArray(data.edits)) errors.push('缺少edits数组');
+  // edits 为空本身不是错误——proposer 有理有据地驳回全部问题时，
+  // 「没有改动」恰恰是正确答案。只有存在 accepted/partially_accepted
+  // 时才强制非空（那个约束在下面逐条校验里做）。
+  // 写死"不能是空数组"会把"全部驳回"这个合法终态误判成契约错误。
 
   const plan = typeof planText === 'string' ? planText : '';
   const issueIds = (critique && critique.issues ? critique.issues : []).map(function (i) {
@@ -509,7 +513,9 @@ function validateRevision(data, critique, planText) {
     issueIds.forEach(function (id) {
       if (!seen.has(id)) errors.push('未回应 issue: ' + id);
     });
-    // 说了要改就必须真给出改动
+    // 说了要改就必须真给出改动。
+    // 反过来也成立：若没有任何 accepted/partially_accepted，edits 为空是合法的
+    // （全部驳回 = 没有要改的地方），不能因为"空"就判失败。
     if (Array.isArray(data.edits) && data.edits.length) {
       data.responses.forEach(function (resp, idx) {
         if (!resp || !resp.decision) return;
@@ -519,6 +525,14 @@ function validateRevision(data, critique, planText) {
             ' 但没有对应的 edit（issueId=' + resp.issueId + '）——方案将原封不动，循环无法收敛');
         }
       });
+    } else if (Array.isArray(data.edits) && data.edits.length === 0) {
+      const hasUpheld = data.responses.some(function (r) {
+        return r && r.decision && r.decision !== 'rejected';
+      });
+      if (hasUpheld) {
+        errors.push('edits 为空，但存在 accepted/partially_accepted 的回应——' +
+          '说了要改却没给改动，方案将原封不动，循环无法收敛');
+      }
     }
   }
   return { ok: errors.length === 0, errors: errors };
@@ -594,6 +608,12 @@ function callReviser(opts) {
     'responses 必须对本轮的 ' + issues.length + ' 条问题逐条回应：' + idList.join('、'),
     'decision 只能是 accepted / rejected / partially_accepted；',
     'rejected 与 partially_accepted 必须给 evidenceLevel（L1/L2/L3）与非空 evidence；',
+    '',
+    '⚠ 长度纪律（超了整轮作废，不是你写得不好，是接口装不下）：',
+    '· 单条 response 不超过 80 字，evidence 不超过 60 字；',
+    '· 结论先行，理由最多一两句；不要复述问题原文；',
+    '· 宁可短，不要把一条回应写成一段论文——',
+    '  实测有过 proposer 给单条回应写超长论证，输出直接撞上限被截断。',
     '',
     'edits 是【外科式改动】，不是重写全文——这是硬性要求：',
     '  · 只给需要真正改动的地方，不要把整份方案重写一遍；',
