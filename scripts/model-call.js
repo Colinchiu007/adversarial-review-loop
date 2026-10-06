@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 // adversarial-review-loop - model-call.js
 // 桥接层: 封装 codeagent-wrapper 调用
@@ -398,29 +398,76 @@ function callCritic(opts) {
 /**
  * 修订方（决策层多轮循环的 proposer 侧）返回值的校验。
  *
- * 契约来自 SKILL.md §5.6.3 的「逐条回应(可拒绝但须给证据)」：
- *   1. responses 必须覆盖 critique 里【每一条】issue，且不重复、不夹带不存在的 id
- *   2. decision ∈ accepted / rejected / partially_accepted
- *   3. rejected 与 partially_accepted 必须附 evidenceLevel(L1/L2/L3) 与非空 evidence
- *      ——「可拒绝但须给证据」，没证据的拒绝等于绕开问题
- *   4. revisedPlan 必须是完整、非空的方案原文
+// ---------- 决策层多轮循环：外科式修订契约 ----------
+//
+// 为什么是「外科式 edits」而不是「重写全文」：
+// 初版要求 proposer 交一份完整 revisedPlan，输出量与【方案大小】成正比。
+// 实测：2KB 方案的重写稿 + 逐条回应就撞上模型输出预算被截断
+// （5030 字符处），而截断发生得毫无征兆、整轮作废。
+// 改成 edits 之后，输出量与【改动量】成正比，小改动就小输出。
+//
+// 更重要的是可校验性：每处 edit 的 before 必须在方案原文里逐字存在，
+// 于是模型无法"顺手重写"、无法悄悄丢掉内容、无法凭空编造改动。
+// 这把「模型说它改了」变成「模型改的那几处确实对得上原文」。
+
+/**
+ * 校验修订返回值。
  *
- * 为什么 responses 与 revisedPlan 放同一次调用里返回：
- * 让「回应」与「改完的方案」出自同一次推理，不会出现
- * 回应里说采纳 A、方案里却没改 A 的自相矛盾——驱动逐条校验后才发现。
+ * 契约：
+ *  1. responses 覆盖 critique 每一条 issue，不漏 / 不重复 / 不夹带不存在的 id
+ *  2. decision ∈ accepted / rejected / partially_accepted
+ *  3. rejected 与 partially_accepted 必须附 evidenceLevel(L1/L2/L3) 与非空 evidence
+ *     ——「可拒绝但须给证据」，没证据的拒绝等于绕开问题
+ *  4. edits 非空；每处 edit 的 before 必须在 planText 中逐字存在且唯一
+ *  5. decision 为 accepted / partially_accepted 的 issue，必须至少有一处 edit
+ *     —— 说了"我改"却没给改动，方案原封不动，循环不可能收敛
  */
-function validateRevision(data, critique) {
+function validateRevision(data, critique, planText) {
   const errors = [];
   if (!data || typeof data !== 'object') return { ok: false, errors: ['数据不是对象'] };
   if (data.schemaVersion === undefined) errors.push('缺少schemaVersion');
   if (!Array.isArray(data.responses)) errors.push('缺少responses数组');
-  if (typeof data.revisedPlan !== 'string' || !data.revisedPlan.trim()) {
-    errors.push('revisedPlan 必须是非空字符串');
-  }
+  if (!Array.isArray(data.edits) || data.edits.length === 0) errors.push('缺少edits数组（不能是空数组）');
 
+  const plan = typeof planText === 'string' ? planText : '';
   const issueIds = (critique && critique.issues ? critique.issues : []).map(function (i) {
     return String(i.id);
   });
+
+  const edited = new Set();
+  if (Array.isArray(data.edits)) {
+    data.edits.forEach(function (ed, idx) {
+      if (!ed || typeof ed !== 'object') {
+        errors.push('edits[' + idx + ']不是对象');
+        return;
+      }
+      if (typeof ed.before !== 'string' || !ed.before.trim()) {
+        errors.push('edits[' + idx + ']before 必须是非空字符串');
+        return;
+      }
+      if (typeof ed.after !== 'string') {
+        errors.push('edits[' + idx + ']after 必须是字符串（删除请给空串）');
+        return;
+      }
+      if (!plan) return; // 无 planText 时跳过存在性校验（单元测试可只测结构）
+      const hits = plan.split(ed.before).length - 1;
+      if (hits === 0) {
+        errors.push('edits[' + idx + ']before 在方案原文中不存在（逐字匹配失败）：' +
+          JSON.stringify(ed.before.slice(0, 40)));
+      } else if (hits > 1) {
+        errors.push('edits[' + idx + ']before 在方案原文中出现 ' + hits +
+          ' 次，无法唯一定位，请给出更长的上下文：' + JSON.stringify(ed.before.slice(0, 40)));
+      }
+      if (ed.issueId !== undefined && ed.issueId !== null) {
+        if (!issueIds.includes(String(ed.issueId))) {
+          errors.push('edits[' + idx + ']issueId ' + ed.issueId + ' 不在本次critique中');
+        } else {
+          edited.add(String(ed.issueId));
+        }
+      }
+    });
+  }
+
   if (Array.isArray(data.responses)) {
     const seen = new Set();
     data.responses.forEach(function (resp, idx) {
@@ -450,13 +497,65 @@ function validateRevision(data, critique) {
     issueIds.forEach(function (id) {
       if (!seen.has(id)) errors.push('未回应 issue: ' + id);
     });
+    // 说了要改就必须真给出改动
+    if (Array.isArray(data.edits) && data.edits.length) {
+      data.responses.forEach(function (resp, idx) {
+        if (!resp || !resp.decision) return;
+        if (resp.decision === 'rejected') return;
+        if (!edited.has(String(resp.issueId))) {
+          errors.push('responses[' + idx + ']decision=' + resp.decision +
+            ' 但没有对应的 edit（issueId=' + resp.issueId + '）——方案将原封不动，循环无法收敛');
+        }
+      });
+    }
   }
   return { ok: errors.length === 0, errors: errors };
 }
 
 /**
+ * 把 edits 逐条应用到方案原文上。
+ *
+ * 顺序应用，且每一条都在应用前重新定位——前一条改掉的内容会让后面的
+ * before 找不到，这时必须明确失败，而不是静默跳过。
+ */
+function applyEdits(planText, edits) {
+  let text = String(planText || '');
+  const applied = [];
+  for (let i = 0; i < (edits || []).length; i++) {
+    const ed = edits[i];
+    const before = ed && ed.before;
+    if (typeof before !== 'string' || !before.length) {
+      return { ok: false, error: 'edits[' + i + ']before 为空，无法应用', applied: applied };
+    }
+    const at = text.indexOf(before);
+    if (at < 0) {
+      // 可能是被前一条 edit 改掉了，也可能一开始就对不上
+      const orig = String(planText).indexOf(before);
+      return {
+        ok: false,
+        error: 'edits[' + i + ']before 应用时找不到：' + JSON.stringify(before.slice(0, 40)) +
+          (orig >= 0
+            ? '（原文里有，但已被前一条 edit 改掉——请合并或调整顺序）'
+            : '（原文里也没有）'),
+        applied: applied,
+      };
+    }
+    if (text.indexOf(before, at + 1) >= 0) {
+      return {
+        ok: false,
+        error: 'edits[' + i + ']before 出现多次，无法唯一定位：' + JSON.stringify(before.slice(0, 40)),
+        applied: applied,
+      };
+    }
+    text = text.slice(0, at) + (typeof ed.after === 'string' ? ed.after : '') + text.slice(at + before.length);
+    applied.push(i);
+  }
+  return { ok: true, text: text, applied: applied, changed: applied.length };
+}
+
+/**
  * 决策层多轮循环的修订调用：给定方案原文 + 上一轮 critique，
- * 返回「逐条回应 + 完整修订后的方案」。
+ * 返回「逐条回应 + 外科式改动」。
  */
 function callReviser(opts) {
   var dims = (opts && opts.dimensions) || DIMENSION_WHITELIST;
@@ -473,31 +572,38 @@ function callReviser(opts) {
     '      "evidence": "证据",             // 仅 rejected / partially_accepted 需要',
     '      "response": "逐条说明" }',
     '  ],',
-    '  "revisedPlan": "完整修订后的方案原文（markdown，直接是正文，不要包在代码块里）"',
+    '  "edits": [',
+    '    { "issueId": "' + (idList[0] || 'i1') + '",',
+    '      "before": "要被替换的原文，必须从方案里逐字复制、且在全文中只出现一次",',
+    '      "after": "替换后的新原文；整段删除则给空串" }',
+    '  ]',
     '}',
     '',
-    'responses 必须对本轮的 ' + issues.length + ' 条问题逐条回应，一条不漏：' + idList.join('、'),
-    'decision 只能是 accepted / rejected / partially_accepted 三选一；',
-    'rejected 与 partially_accepted 必须同时给 evidenceLevel（L1/L2/L3）与非空 evidence；',
-    'accepted 可以不写 evidenceLevel；',
-    'revisedPlan 必须是【完整】的方案原文，读者只看它就能实施，不能只写 diff 或增量；',
-    '被拒绝的问题必须在 revisedPlan 里真正改掉或明确写出为何不改，否则视为未解决。',
-    '维度（用于自检改完是否到位）：' + dims.join('、'),
+    'responses 必须对本轮的 ' + issues.length + ' 条问题逐条回应：' + idList.join('、'),
+    'decision 只能是 accepted / rejected / partially_accepted；',
+    'rejected 与 partially_accepted 必须给 evidenceLevel（L1/L2/L3）与非空 evidence；',
+    '',
+    'edits 是【外科式改动】，不是重写全文——这是硬性要求：',
+    '  · 只给需要真正改动的地方，不要把整份方案重写一遍；',
+    '  · before 必须从上面的方案里【逐字复制】，一个字都不能改（包括标点与缩进）；',
+    '  · before 在方案全文中必须只出现一次；不唯一就多带几行上下文把它变唯一；',
+    '  · 一处改动一个 edit，不要把不相关的改动合并进同一个 before；',
+    '  · decision 为 accepted / partially_accepted 的问题必须至少有一处对应的 edit；',
+    '    只有 rejected 的问题可以不给 edit（因为你有证据说明它不成立）；',
+    '  · after 里不要出现 [描述现状]、[待填写] 这类占位符。',
+    '',
+    '维度（用于自检改动是否到位）：' + dims.join('、'),
   ].join('\n');
 
   // ⚠ 形状对 opencode 是决定性的：必须是「单个连续的祈使句」开头。
-  //
   // 实测（同一问题，只改 stdin 的形状）：
   //   "角色说明" + --- + "问题"   -> 只回「明白…请提问」，问题整段丢失
   //   仅 "问题"（单句祈使）        -> 正常作答
   //   "一句前言" + 空行 + "问题"  -> 只回「明白，请说你的需求」，问题丢失
   //   以 markdown 标题开头的方案   -> 只收到标题行，正文全丢
-  //
   // 规律：opencode 把第一段当"对我说话的开场"回掉就结束这一轮。
-  // 能活下来的形状只有一个——第一句就是祈使句，内容紧随其后不断句。
-  // 所以这里以「请修订…」起头，方案用 <plan> 包裹紧跟，不留标题式开场。
   var tp = [
-    '请修订下面这份方案，逐条回应它收到的评审意见，并按末尾给出的 JSON 结构输出结果。',
+    '请修订下面这份方案，逐条回应它收到的评审意见，并用外科式 edits 给出改动。',
     '',
     '<plan>',
     opts.planText,
@@ -509,11 +615,9 @@ function callReviser(opts) {
     '--- 以下是你的作业要求 ---',
     '你是出方案方（Proposer）。不要探索项目文件，不要使用任何工具。',
     '若上面的 <plan> 标签内没有内容、或评审意见是空的，说明输入没有完整送达，',
-    '此时只输出 {"schemaVersion":1,"responses":[],"revisedPlan":"任务未送达"}，',
+    '此时只输出 {"schemaVersion":1,"responses":[],"edits":[],"planUndelivered":true}，',
     '不要输出任何模板、示例或占位符。',
-    '否则：reviews 里的每一条都要在 responses 中逐条回应，不许漏；',
-    'rejected 与 partially_accepted 必须给 evidenceLevel(L1/L2/L3) 与非空 evidence；',
-    'revisedPlan 是对 <plan> 的完整重写，不得出现 [描述现状] 这类占位符。',
+    '否则：responses 里每一条都要回应，不许漏；改动作���走 edits，不要重写全文。',
     '',
     '输出结构：',
     schemaHint,
@@ -528,57 +632,47 @@ function callReviser(opts) {
   const p = extractJson(r.output);
   if (!p.ok) {
     const hint = p.truncated
-      ? ' —— 修订稿过长被截断。请让 revisedPlan 更紧凑，或把方案拆小后分轮修订。'
+      ? ' —— 修订稿过长被截断。请把 edits 拆得更小、只给真正要改的地方。'
       : '';
     return {
       ok: false, error: 'JSON解析失败:' + p.error + hint,
-      truncated: !!p.truncated, length: p.length, raw: p.raw, rawOutput: r.output,
+      truncated: !!p.truncated, length: p.length, tail: p.tail,
+      raw: p.raw, rawOutput: r.output,
     };
   }
-  // 哨兵判定放在契约校验之前：模型报告"任务未送达"时，
-  // responses 必然是空数组，validateRevision 会报一串「未回应 issue: i1..i6」，
-  // 把真正的病因（输入没完整送达）埋在噪音里。先认哨兵，报真正的错。
-  if (typeof p.data.revisedPlan === 'string' && p.data.revisedPlan.indexOf('任务未送达') >= 0) {
+  // 哨兵判定前置于契约校验：模型报告"任务未送达"时 responses/edits 必然是空，
+  // validateRevision 会报一串「未回应 issue / 缺少 edits」，把病因埋在噪音里。
+  if (p.data && (p.data.planUndelivered === true ||
+      (p.data.responses || []).some(function (x) {
+        return x && typeof x.response === 'string' && x.response.indexOf('任务未送达') >= 0;
+      }))) {
     return {
       ok: false,
-      error: '模型报告任务未送达：该后端只消费 stdin 的第一段，' +
-        '本提示的方案正文与评审意见没进模型。' +
+      error: '模型报告任务未送达：该后端只消费 stdin 的第一段，本提示的方案正文与评审意见没进模型。' +
         '实测规律——opencode 只认「单个连续祈使句」开头的输入；' +
         '若仍失败请改用 --proposer claude（它能收全整个 stdin）。',
       taskNotDelivered: true,
       data: p.data, rawOutput: r.output,
     };
   }
-
-  const v = validateRevision(p.data, opts.critique);
+  const v = validateRevision(p.data, opts.critique, opts.planText);
   if (!v.ok) {
     return {
       ok: false, error: 'Revision校验失败', validationErrors: v.errors,
       data: p.data, rawOutput: r.output,
     };
   }
-  // 占位符检测：模型跑偏时会输出一份"通用方案模板"，字段结构完全合法、
-  // 逐条回应也做得像模像样，但 revisedPlan 里全是 [描述现状] 这类占位符。
-  // 不拦的话，一份模板会被当成"修订稿"接受，而循环随即收敛——比直接失败糟得多。
-  const plan = String(p.data.revisedPlan || '');
-  const placeholders = plan.match(/\[[^\]\n]{2,20}\]/g) || [];
-  // 方案里合理出现方括号的情况极少；真出现时按可疑处理，但只当警告不硬拦
-  const SUSPECT = placeholders.filter((x) => /描述|待填|待定|主题|填写|示例|某某|TODO/i.test(x));
-  if (SUSPECT.length) {
+  // 占位符检测：模型跑偏时会给出像模像样的 edits，但 after 全是 [描述现状] 这类占位符。
+  // 不拦就会把占位符当成真改动应用进方案，然后循环"收敛"。
+  const bad = (p.data.edits || []).filter(function (e) {
+    return typeof e.after === 'string' &&
+      /\[(描述|待填|待定|主题|填写|示例|某某|TODO)[^\]]*\]/i.test(e.after);
+  });
+  if (bad.length) {
     return {
       ok: false,
-      error: '修订稿疑似模板占位符而非真实修订：检出 ' + SUSPECT.length + ' 处（' +
-        SUSPECT.slice(0, 5).join('、') + '）',
-      placeholder: true,
-      placeholders: SUSPECT.slice(0, 10),
-      data: p.data, rawOutput: r.output,
-    };
-  }
-  if (plan.indexOf('任务未送达') >= 0) {
-    return {
-      ok: false, taskNotDelivered: true,
-      error: '修订稿仍是任务未送达哨兵',
-      data: p.data, rawOutput: r.output,
+      error: 'edit 的 after 疑似模板占位符而非真实改动：' + bad.length + ' 处',
+      placeholder: true, data: p.data, rawOutput: r.output,
     };
   }
   return { ok: true, data: p.data, rawOutput: r.output, attempt: r.attempt };
@@ -613,7 +707,7 @@ function resolveBackends(preferred, available) {
 module.exports = {
   DEFAULT_WRAPPER, DEFAULT_TIMEOUT_MS, DEFAULT_RETRY_COUNT,
   arlRolePrompt, probeBackend, extractJson, validateCritique, validateRebuttal,
-  validateRevision, callReviser, backendInputLimit, BACKEND_INPUT_LIMIT,
+  validateRevision, callReviser, applyEdits, backendInputLimit, BACKEND_INPUT_LIMIT,
   normalizeCritique, FIELD_ALIASES,
   callModel, callCritic, callProposer, callRebutter, resolveBackends,
   SEVERITY_WHITELIST, DIMENSION_WHITELIST, DECISION_WHITELIST, EVIDENCE_WHITELIST

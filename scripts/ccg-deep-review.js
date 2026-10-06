@@ -721,18 +721,36 @@ function runDecisionLayer(sha, proposalFile) {
     }
 
     engine.writeArtifact(dir, `revision-v${round}.md`, JSON.stringify(rv.data, null, 2));
-    const revised = String(rv.data.revisedPlan || "").trim();
-    if (!revised || revised === planText.trim()) {
-      // 回应了但方案一个字没改：再跑一轮也是同样的结果，白烧 token
-      console.log("  ⚠ 修订稿与当前方案无差异 —— 提前停止（继续循环不会改变结果）");
+
+    // 外科式应用：每处 before 都在当前文本里重新定位后才替换。
+    // 应用失败必须明确报错，不能"尽力而为"地跳过——那会留下半改不改的方案，
+    // 下一轮再评审时看起来像是改过了，实际没改。
+    const ap = mc.applyEdits(planText, rv.data.edits);
+    if (!ap.ok) {
+      console.error("  ✗ edits 应用失败: " + ap.error);
+      writeBack(sha, {
+        required: true, layer: "decision", status: "error", performedBy: cfg.proposer,
+        objectType: "plan", rounds: history,
+        error: "edits应用失败:" + ap.error,
+        note: `第 ${round} 轮的 edits 无法应用（已成功应用 ${ap.applied.length} 处，未回滚）`,
+        artifacts: path.relative(REPO, dir), at: new Date().toISOString(),
+      });
+      return 2;
+    }
+    if (ap.text === planText) {
+      console.log("  ⚠ edits 应用后方案无变化 —— 提前停止（继续循环不会改变结果）");
       stoppedBy = "no_revision";
       break;
     }
     const accepted = (rv.data.responses || []).filter((r) => r.decision === "accepted").length;
     const rejected = (rv.data.responses || []).filter((r) => r.decision === "rejected").length;
     const partial = (rv.data.responses || []).filter((r) => r.decision === "partially_accepted").length;
-    console.log(`  修订完成：采纳 ${accepted} / 有证据拒绝 ${rejected} / 部分采纳 ${partial}`);
-    planText = revised;
+    console.log(
+      `  修订完成：应用 ${ap.applied.length} 处改动；` +
+        `回应 采纳 ${accepted} / 有证据拒绝 ${rejected} / 部分采纳 ${partial}`
+    );
+    planText = ap.text;
+    engine.writeArtifact(dir, `plan-v${round + 1}.md`, planText);
   }
 
   // ---------- 裁决 ----------
