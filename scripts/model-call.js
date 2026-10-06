@@ -314,7 +314,11 @@ function callModel(opts) {
       }
       if (result.error) {
         lastError = result.error;
-        if (attempt < retries) continue;
+        // 超时/被杀这类"本来就慢"的失败，重试没有意义：
+        // 实测 proposer 侧 3 次重试 × 10 分钟 = 30 分钟纯烧。
+        // 只有可恢复的瞬时错误（exit 非零、stderr 有内容）才值得再打。
+        const retriable = !/ETIMEDOUT|ENOMEM|ENOSPC/i.test(String(result.error.code || result.error.message || ''));
+        if (attempt < retries && retriable) continue;
         return { ok: false, error: result.error.message, attempt: attempt + 1 };
       }
       if (result.status !== 0 && !stdout) {
@@ -680,6 +684,8 @@ function callReviser(opts) {
     '    那会把 + / - / 前导空格这些 diff 标记一起带进来，永远对不上原文；',
     '    要改 diff 块所描述的内容，就改它上下的说明文字；',
     '  · before 在方案全文中必须只出现一次；不唯一就多带几行上下文把它变唯一；',
+    '  · before 尽量短（80 字以内）。越长定位越慢——在几千字里找到它并逐字',
+    '    复现是本环节最耗时的动作，长 before 会让整轮超时；',
     '  · 一处改动一个 edit，不要把不相关的改动合并进同一个 before；',
     '  · decision 为 accepted / partially_accepted 的问题必须至少有一处对应的 edit；',
     '    只有 rejected 的问题可以不给 edit（因为你有证据说明它不成立）；',
@@ -719,7 +725,12 @@ function callReviser(opts) {
   const r = callModel({
     backend: opts.backend, role: 'proposer', workdir: opts.workdir,
     taskPrompt: tp, wrapperPath: opts.wrapperPath,
-    timeoutMs: opts.timeoutMs, retryCount: opts.retryCount,
+    // reviser 的超时独立于 critic，且默认不重试。
+    // 实测：critic 约 1 分钟返回，reviser 10 分钟跑不完
+    //（要逐条定位并逐字复现 before，比"读完打几个分"重一个数量级）。
+    // 共用 cfg.timeoutMs 是缺陷；且超时重试 3 次 = 30 分钟纯烧。
+    timeoutMs: opts.reviserTimeoutMs || (opts.timeoutMs ? opts.timeoutMs * 2 : undefined),
+    retryCount: opts.reviserRetryCount !== undefined ? opts.reviserRetryCount : 0,
   });
   if (!r.ok) return r;
   const p = extractJson(r.output);
