@@ -94,6 +94,9 @@ function cfgForMode(mode) {
     objectType: "code",
     maxRounds: 3,
     scoreThreshold: 8.0,
+  // ⚠ 该阈值已不再是放行判据（2026-10-08 改判据后）。
+  // 放行改由「无 Critical 且无未解决的 High」决定，见 runDecisionLayer 的裁决链。
+  // 这里保留字段只为向后兼容旧记录与对照历史数据，不要拿它做判定。
     dimensions: ["correctness", "security", "performance", "maintainability"],
     stallScoreDelta: 0.5,
     stallRounds: 2,
@@ -580,12 +583,12 @@ function runDecisionLayer(sha, proposalFile) {
   // 出方案方永远没有机会回应 Critical，多轮收敛形同虚设。
   //
   // 现在按「critic 挑刺 → proposer 逐条回应并改方案 → 再评审」真跑，
-  // 终止条件与原来一致（只由 Critical 数与最低维度分决定）：
-  //   有 Critical            → 还要下一轮
-  //   无 Critical 且 minScore ≥ 阈值 → cleared，立即停
-  //   无 Critical 且 minScore < 阈值 → 还要下一轮
+  // 终止条件由【未解决的最高级别】决定，不再由绝对分数决定：
+  //   无 Critical 且无 High   → cleared，立即停
+  //   有 Critical 或有 High   → 还要下一轮
   //   轮次耗尽               → 还有 Critical 记 blocked，否则 needs_revision
-  const threshold = cfg.scoreThreshold || 8.0;
+  //
+  // 分数（minScore）仍逐轮记录、展示、落盘，作参考信息；但它不再是放行判据。
   const history = [];
   let planText = text;
   let critique = null;
@@ -691,8 +694,20 @@ function runDecisionLayer(sha, proposalFile) {
       bestText = planText;
       regressedBestRound = round;
     }
-    // 唯一放行条件
-    if (critCritical === 0 && minScore >= threshold) {
+    const critHigh = (critique.issues || []).filter((i) => i.severity === "High").length;
+    // 唯一放行条件：按【未解决的最高级别】判定，不再用绝对分数。
+    //
+    // 为什么改：分数门槛（≥8）在 13 次真实评审中一次都没达到，是个死分支；
+    // 而它该做的事——拦住致命错误——其实 Critical 那一档已经在做。
+    // 中间那档（needs_revision）的文案本来就写着"可动手，但建议补强"，
+    // 可见 ≥8 这档从未真正拦住过任何人，只是把"建议"错误地呈现成"未通过"。
+    //
+    // 新判据是可回答的二值问题，不再有"8 分到底是多少"的可达性疑问：
+    //   有 Critical            -> blocked
+    //   有未解决的 High        -> needs_revision（可动手，建议先补强）
+    //   其余                   -> cleared
+    // 分数仍记录与展示，作参考信息，不作放行判据。
+    if (critCritical === 0 && critHigh === 0) {
       stoppedBy = "converged";
       break;
     }
@@ -783,6 +798,8 @@ function runDecisionLayer(sha, proposalFile) {
   }
 
   // ---------- 裁决 ----------
+  // 最后一轮的未解决项按级别统计（与放行判据同一口径）
+  const lastHigh = (critique.issues || []).filter((i) => i.severity === "High").length;
   let verdict, verdictWhy;
   if (stoppedBy === "incomplete") {
     verdict = "incomplete";
@@ -791,7 +808,9 @@ function runDecisionLayer(sha, proposalFile) {
       "重跑仍无维度分则需检查 critic 契约——不允许把这种结果当作通过";
   } else if (stoppedBy === "converged") {
     verdict = "cleared";
-    verdictWhy = `第 ${history.length} 轮无 Critical 且最低维度分 ${minScore} ≥ ${threshold}，方案可执行`;
+    verdictWhy =
+      `第 ${history.length} 轮：无 Critical、无未解决的 High 级问题，方案可执行` +
+      `（最低维度分 ${minScore}，仅作参考，不作放行判据）`;
   } else if (critCritical > 0) {
     verdict = "blocked";
     verdictWhy =
@@ -800,11 +819,12 @@ function runDecisionLayer(sha, proposalFile) {
   } else {
     verdict = "needs_revision";
     verdictWhy =
-      `跑满 ${maxRounds} 轮无 Critical 但最低维度分仍为 ${minScore} < ${threshold}；` +
-      (stoppedBy === "no_revision" ? "且修订稿与原方案无差异，自动循环已无法推进" :
+      `跑满 ${maxRounds} 轮：无 Critical，但有 ${lastHigh} 条 High 级问题未解决——` +
+      "**可以动手**，建议先按最后一轮 critique 补强；" +
+      (stoppedBy === "no_revision" ? "且修订稿与原方案无差异，自动循环已无法推进。" :
         stoppedBy === "regressed"
-          ? `且第 ${regressedFrom.round} 轮把分数从 ${regressedFrom.best} 改低到 ${regressedFrom.got}，已回滚到最好的一版`
-          : "建议继续补强");
+          ? `第 ${regressedFrom.round} 轮把最低分从 ${regressedFrom.best} 改到 ${regressedFrom.got}，已回滚到最好的一版。`
+          : "");
   }
 
   console.log(`\n── 多轮轨迹 ──`);
@@ -829,11 +849,13 @@ function runDecisionLayer(sha, proposalFile) {
   console.log(`  产物: ${path.relative(REPO, dir)}（proposal-vN / critique-vN / revision-vN 已配对落盘）`);
 
   if (verdict === "blocked") {
-    console.log("  → Critical 未解决，需人工介入或提高方案质量后重跑");
+    console.log("  → 阻断：Critical 未解决，必须先逐条回应（可拒绝但须给证据）后再重跑");
   } else if (verdict === "incomplete") {
     console.log("  → 阻断：评审不完整不等于通过");
   } else if (verdict === "needs_revision") {
-    console.log("  → 可动手，但建议按最后一轮 critique 补强");
+    console.log("  → 可动手：无 Critical，剩余为 High 级建议项，建议按最后一轮 critique 补强");
+  } else if (verdict === "cleared") {
+    console.log("  → 放行：无 Critical、无未解决的 High 级问题");
   }
 
   writeBack(sha, {
@@ -845,6 +867,15 @@ function runDecisionLayer(sha, proposalFile) {
     minScore: minScore,
     dimensionScores: sc.dimScores,
     findings: critique.issues || [],
+    // 放行判据改为严重度后，把各级计数一并落盘，便于事后审计"为什么放行/阻断"
+    unresolvedBySeverity: {
+      Critical: (critique.issues || []).filter((i) => i.severity === "Critical").length,
+      High: (critique.issues || []).filter((i) => i.severity === "High").length,
+      Warning: (critique.issues || []).filter((i) => i.severity === "Warning").length,
+      Info: (critique.issues || []).filter((i) => i.severity === "Info").length,
+    },
+    // scoreThreshold 仍记录，便于对照历史；但已不再用于判定
+    scoreThreshold: cfg.scoreThreshold,
     rounds: history,
     roundsRun: history.length,
     roundsMax: maxRounds,
