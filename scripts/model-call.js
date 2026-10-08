@@ -20,6 +20,42 @@ const RETRY_BACKOFF_MS = 8000;
 // 数字可调；宁少勿长。
 const MAX_CRITIC_ISSUES = 8;
 
+// ⚠⚠ opencode 必须绕开 codeagent-wrapper，直接 spawn。
+//
+// 病因（对照实验，同一个 prompt 只换调用路径）：
+//   Node 直连 opencode stdin      -> 1889 字符完整评审，0 Critical
+//   spawnSync 走 codeagent-wrapper -> 81 字符「方案内容和 JSON 结构都缺失」
+//
+// wrapper 的 stderr 会把它实际执行的命令行打出来：
+//   Command: opencode run --format json <整个多行中文 prompt>
+// 也就是说 wrapper 把 prompt 拼进【命令行参数】而不是 stdin。
+// 多行中文经 argv 传递时被逐行吃掉——回显里能直接看到截断痕迹：
+//   「销掉两条依赖漏洞登□」← 「记」被切掉，且末尾若干字符连成乱码。
+//
+// 于是 opencode 每次只收到 prompt 的第一行，模型如实回答
+// 「方案内容未附上」。这就是跨家族审核里 opencode 反复失败的真正原因：
+// 与 prompt 长度、prompt 结构、是否重复消费 stdin 都无关（三者均已对照排除）。
+//
+// 为什么 claude 侧不走这条路：wrapper 对 claude 一直正常，
+// 没有证据支持为了统一而改动一条正在工作的链路。
+const OPENCODE_DIRECT_BIN = {
+  opencode: 'D:/Data/opencode/opencode.cmd',
+};
+
+// 直连失败时是否回落到 wrapper。默认不回落——
+// 回落等于静默退回那条已知截断的路径，重现"编造评分"的老问题。
+// 需要回落时由调用方显式传 allowWrapperFallback。
+function spawnDirectOpencode(binPath, prompt, workdir, timeout) {
+  const r = cp.spawnSync(binPath, ['run', '--format', 'json'], {
+    input: prompt, timeout: timeout, encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024, shell: true, windowsHide: true,
+  });
+  return {
+    stdout: r.stdout || '', stderr: r.stderr || '',
+    status: r.status, error: r.error,
+  };
+}
+
 // ⚠ 哪些后端要求「任务内容必须排在提示的最前面」。
 //
 // opencode 把 stdin 的第一段当"设置/寒暄"，回完就结束这一轮，
@@ -102,6 +138,19 @@ function arlRolePrompt(role, backend) {
 }
 
 function probeBackend(backend, wrapperPath, workdir) {
+  // opencode 有直连路径，探活必须走同一条，否则探活结果与实际调用路径不一致。
+  const directBin = OPENCODE_DIRECT_BIN[backend];
+  if (directBin && fs.existsSync(directBin)) {
+    try {
+      const r = spawnDirectOpencode(directBin, '只回复 OK 两个字符，不要多余内容。', workdir, 60000);
+      const out = (r.stdout || '');
+      return {
+        available: !!out && /OK/.test(out),
+        stdout: out.substring(0, 200), stderr: (r.stderr || '').substring(0, 200),
+        path: 'direct-stdin',
+      };
+    } catch (e) { return { available: false, error: e.message, path: 'direct-stdin' }; }
+  }
   try {
     const result = cp.spawnSync(wrapperPath, ['--backend', backend, '--lite', '-', workdir], {
       input: 'echo OK', timeout: 15000, encoding: 'utf8', shell: false, windowsHide: true
@@ -126,9 +175,70 @@ const EVIDENCE_WHITELIST = ['L1','L2','L3'];
  * JSON.parse 失败，旧代码只报「无法提取有效JSON」——
  * 看到这个报错完全猜不到是长度问题，只会反复重跑碰运气。
  */
+/**
+ * 解析 opencode `run --format json` 的流式输出（JSONL）。
+ *
+ * 返回值有两种形态：
+ *  - 直接命中评审 JSON（最后一个 text 事件本身就是那个 JSON）
+ *    → 原样返回，后续照常走 validateCritique
+ *  - 最后拿到的是「带 \n 转义的 JSON 字符串」
+ *    → 解一次转义，再递归 extractJson
+ *
+ * 返回 null 表示"这不是可识别的 JSONL"，调用方继续走原路径。
+ *
+ * 为什么必须做：见 extractJson 里的注释——贪婪匹配会吞掉整个事件流。
+ */
+function tryParseJsonl(s) {
+  const lines = s.split(/\r?\n/).filter(function (l) { return l.trim(); });
+  if (lines.length < 2) return null;
+
+  let sawEvent = false;
+  let textParts = [];
+  for (const line of lines) {
+    let o;
+    try { o = JSON.parse(line); } catch { return null; }   // 有任一行不是 JSON → 不是 JSONL
+    if (!o || typeof o !== 'object' || typeof o.type !== 'string') return null;
+    sawEvent = true;
+    if (o.type === 'text' && o.part && typeof o.part.text === 'string') {
+      textParts.push(o.part.text);
+    }
+  }
+  if (!sawEvent || textParts.length === 0) return null;
+
+  // 多个 text 事件按顺序拼接（长输出会被模型分段吐）
+  const joined = textParts.join('');
+  try { return JSON.parse(joined); } catch { /* 继续：可能是被转义的 JSON 字符串 */ }
+
+  // 模型把整个 JSON 当成一个字符串字面量吐出来（opencode 的 text 事件常见形态）
+  try {
+    const unquoted = JSON.parse('"' + joined.replace(/"/g, '\\"') + '"');
+    const inner = extractJson(unquoted);
+    if (inner.ok) return inner.data;
+  } catch { /* 落到 null */ }
+
+  return null;
+}
+
 function extractJson(text) {
   const s = String(text || '');
   try { return { ok: true, data: JSON.parse(s) }; } catch (e) { /* 继续 */ }
+
+  // ⚠ 必须先处理 JSONL（每行一个 JSON 对象），再走下面的贪婪匹配。
+  //
+  // opencode run --format json 输出的是流式事件，每行一个 JSON：
+  //   {"type":"step_start",...}
+  //   {"type":"text","part":{"text":"<真正的评审 JSON，用 \n 转义>"}}
+  //   {"type":"step_finish",...}
+  //
+  // 旧的 /\{[\s\S]*\}/ 是贪婪匹配，会从第一个 { 一路吃到最后一个 }，
+  // 于是把 step_start 到 step_finish 全吞成一个字符串，
+  // 报 "Additional text encountered after finished reading JSON content"。
+  // 这是直连后端拿到完整评审却仍被判解析失败的原因。
+  //
+  // 判定方式：绝大多数行都能独立 JSON.parse，且存在 type 字段。
+  // 不靠"看起来像 JSONL"猜，避免误伤模型输出的正常多行文本。
+  const jsonl = tryParseJsonl(s);
+  if (jsonl) return { ok: true, data: jsonl };
 
   const m = s.match(/\{[\s\S]*\}/);
   if (m) {
@@ -319,14 +429,22 @@ function callModel(opts) {
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const result = cp.spawnSync(wrapper, ['--backend', backend, '--lite', '-', workdir], {
-        input: fullPrompt, timeout: timeout, encoding: 'utf8', maxBuffer: 10*1024*1024, shell: false, windowsHide: true
-      });
+      // opencode 走直连（stdin），其余后端仍走 wrapper。理由见 OPENCODE_DIRECT_BIN。
+      const directBin = OPENCODE_DIRECT_BIN[backend];
+      const useDirect = !!directBin && fs.existsSync(directBin);
+
+      const result = useDirect
+        ? spawnDirectOpencode(directBin, fullPrompt, workdir, timeout)
+        : cp.spawnSync(wrapper, ['--backend', backend, '--lite', '-', workdir], {
+            input: fullPrompt, timeout: timeout, encoding: 'utf8',
+            maxBuffer: 10*1024*1024, shell: false, windowsHide: true,
+          });
+
       const stdout = (result.stdout || '').trim();
       const stderr = (result.stderr || '').trim();
       const isWrapperDiagnostic = stderr.startsWith('[codeagent-wrapper]');
       if (!isWrapperDiagnostic && stderr && !stdout) {
-        lastError = new Error('wrapper stderr: ' + stderr.substring(0, 500));
+        lastError = new Error((useDirect ? 'backend' : 'wrapper') + ' stderr: ' + stderr.substring(0, 500));
         if (attempt < retries) continue;
         return { ok: false, error: lastError.message, attempt: attempt + 1, stderr: stderr.substring(0, 1000) };
       }
