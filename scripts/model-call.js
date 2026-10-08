@@ -20,6 +20,24 @@ const RETRY_BACKOFF_MS = 8000;
 // 数字可调；宁少勿长。
 const MAX_CRITIC_ISSUES = 8;
 
+// ⚠ 哪些后端要求「任务内容必须排在提示的最前面」。
+//
+// opencode 把 stdin 的第一段当"设置/寒暄"，回完就结束这一轮，
+// 后面的内容压根没进模型。实测（同一问题，只改 stdin 的形状）：
+//   "角色说明" + --- + "问题"        -> 只回「明白…请提问」，问题整段丢失
+//   仅 "问题"（单句祈使）             -> 正常作答
+//   "一句前言" + 空行 + "问题"        -> 只回「明白，请说你的需求」
+//   以 markdown 标题开头的方案         -> 只收到标题行，正文全丢
+//   "请评审以下方案（第1轮）：" + 空行 + 方案 + schema
+//                                    -> 只收到第一行，模型回「方案内容未附上」
+//
+// claude 侧两种顺序都能收全，保持原样不冒险。
+//
+// ⚠ 必须放在【模块级】。critic 与 reviser 是两个独立函数，
+// 声明在 callModel 体内时 callCritic 会抛 ReferenceError（踩过两次）。
+const BACKEND_TASK_MUST_LEAD = { opencode: true };
+
+
 /**
  * 各后端的输入长度上限（字符数）。超限会被后端**同步拒绝**。
  *
@@ -268,9 +286,9 @@ function callModel(opts) {
   // 后面的内容压根没进模型。所以任务内容必须排在最前面，
   // 角色与硬性要求挪到末尾。
   // claude 侧两种顺序都能收全，保持原样不冒险。
-  const TASK_MUST_LEAD = { opencode: true };
+  // 提示词顺序：opencode 要求任务在前（清单见模块级 BACKEND_TASK_MUST_LEAD），其余后端保持原样。
   const rolePrompt = arlRolePrompt(role, backend);
-  const fullPrompt = TASK_MUST_LEAD[backend]
+  const fullPrompt = BACKEND_TASK_MUST_LEAD[backend]
     ? (taskPrompt + '\n\n---\n\n' + rolePrompt)
     : (rolePrompt + '\n\n---\n\n' + taskPrompt);
 
@@ -382,8 +400,36 @@ function callCritic(opts) {
     '  实测有过 critic 给单条 issue 写超长 finding，输出直接撞上限被截断，整轮白跑。',
   ].join('\n');
 
-  var tp = '请评审以下方案（第' + opts.roundN + '轮）：\n\n' + opts.proposalText
-    + '\n\n' + schemaHint + '\n\n请输出JSON格式的评审结果。';
+  // ⚠ 形状对 opencode 是决定性的：待评审内容必须排在最前面。
+  //
+  // 实测踩到：prompt 写成 "请评审以下方案（第1轮）：\n\n<方案>\n\n<schema>"
+  // 时，opencode 只收到第一行，原话是
+  //   「方案内容未附上——消息里只有「请评审以下方案（第1轮）：」，后面是空的」
+  // 然后要求我"再贴一次方案"。整轮评审作废。
+  //
+  // 这与 reviser 侧是同一个病因（见 callReviser 的注释），
+  // 当时只改了 reviser 漏了 critic —— 而 critic 恰恰是跨家族审核里
+  // 最关键的那一环。靠"强制跑双家族"这条要求把它暴露出来。
+  const probe = BACKEND_TASK_MUST_LEAD[opts.backend];
+  var tp = probe
+    ? [
+      '请评审下面这份方案，然后按末尾给出的 JSON 结构输出评审结果。',
+      '',
+      '<plan>',
+      opts.proposalText,
+      '</plan>',
+      '',
+      '--- 以下是你的作业要求 ---',
+      '不要探索项目文件，不要使用任何工具。',
+      '若上面的 <plan> 标签内没有内容，说明输入没有完整送达——',
+      '此时只输出 {"schemaVersion":1,"issues":[],"dimensionScores":{}}，',
+      '并在第一条 issue 的 finding 里写明"输入未送达"，不要编造评审意见。',
+      '',
+      '输出结构：',
+      schemaHint,
+    ].join('\n')
+    : '请评审以下方案（第' + opts.roundN + '轮）：\n\n' + opts.proposalText
+      + '\n\n' + schemaHint + '\n\n请输出JSON格式的评审结果。';
 
   // 解析失败可以重试：这类失败是随机的，不重试等于白白丢掉一次评审。
   // 实测：第 2 轮 critic 只吐了 91 字符就停了（`{"schemaVersion":1,"issues":[`），
