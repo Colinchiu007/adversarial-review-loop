@@ -42,7 +42,9 @@ const OPENCODE_DIRECT_BIN = {
   // 默认是本机绝对路径；换机器/换布局时用环境变量覆盖，不必改代码。
   // 没有合法路径时宁可快速失败（见 callModel 的前置检查），绝不静默回落 wrapper
   // ——回落等于退回那条已知截断多行中文的路径，重现"编造评分"的老问题。
-  opencode: process.env.ARL_OPENCODE_BIN || 'D:/Data/opencode/opencode.cmd',
+  opencode: (process.env.ARL_OPENCODE_BIN !== undefined
+    ? process.env.ARL_OPENCODE_BIN
+    : 'D:/Data/opencode/opencode.cmd'),
 };
 
 /**
@@ -158,7 +160,8 @@ function probeBackend(backend, wrapperPath, workdir) {
   // wrapper 对单行短探活是正常的，探出来 available=true 是假阳性，
   // 真实评审（多行长 prompt）才会踩截断。
   const directBin = resolveDirectBin(backend);
-  if (OPENCODE_DIRECT_BIN[backend]) {
+  // 与 callModel 同一判据：in 检查而非 truthiness（空字符串配置是合法的"已配置但无效"）
+  if (backend in OPENCODE_DIRECT_BIN) {
     if (!directBin) {
       return {
         available: false,
@@ -464,11 +467,22 @@ function callModel(opts) {
   // 只有长多行 prompt 才会暴露截断。所以这道检查必须在真实调用前做，
   // 并给出可操作的修复信息（对齐输入超长护栏的做法）。
   const directBin = resolveDirectBin(backend);
-  if (OPENCODE_DIRECT_BIN[backend] && !directBin) {
+  // ⚠ 判据必须是「该后端是否配置了直连」（in 检查），不能用配置值的 truthiness：
+  // ARL_OPENCODE_BIN="" 时配置值是空字符串（falsy），用 truthiness 判断会误判为
+  // "未配置直连"而静默走 wrapper——claude 评审 i1 抓到的正是这条复发路径（实测复现）。
+  if (backend in OPENCODE_DIRECT_BIN && !directBin) {
+    // i4（claude 评审）：区分「未设置走默认值」与「显式设了但无效」——
+    // CI 里常见的 ARL_OPENCODE_BIN="" 若静默降级到硬编码 D:/ 路径，
+    // 报错会误导用户去检查一个其实已设置的变量。
+    const configured = process.env.ARL_OPENCODE_BIN;
+    const envHint = configured !== undefined
+      ? '环境变量 ARL_OPENCODE_BIN 已设置但指向的路径不存在: "' + configured +
+        '"。请改为指向 opencode 可执行文件（或 unset 该变量以用内置默认路径）。'
+      : 'opencode 直连路径不存在: ' + OPENCODE_DIRECT_BIN[backend] +
+        '。设置环境变量 ARL_OPENCODE_BIN 指向 opencode 可执行文件后重试。';
     return {
       ok: false,
-      error: 'opencode 直连路径不存在: ' + OPENCODE_DIRECT_BIN[backend] +
-        '。设置环境变量 ARL_OPENCODE_BIN 指向 opencode 可执行文件后重试；' +
+      error: envHint +
         '不要绕过此检查回落 wrapper——wrapper 会截断多行中文 prompt，产生编造的评审。',
       configMissing: true,
       backend,
