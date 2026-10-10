@@ -39,8 +39,22 @@ const MAX_CRITIC_ISSUES = 8;
 // 为什么 claude 侧不走这条路：wrapper 对 claude 一直正常，
 // 没有证据支持为了统一而改动一条正在工作的链路。
 const OPENCODE_DIRECT_BIN = {
-  opencode: 'D:/Data/opencode/opencode.cmd',
+  // 默认是本机绝对路径；换机器/换布局时用环境变量覆盖，不必改代码。
+  // 没有合法路径时宁可快速失败（见 callModel 的前置检查），绝不静默回落 wrapper
+  // ——回落等于退回那条已知截断多行中文的路径，重现"编造评分"的老问题。
+  opencode: process.env.ARL_OPENCODE_BIN || 'D:/Data/opencode/opencode.cmd',
 };
+
+/**
+ * 解析某后端的直连可执行文件；后端无直连需求时返回 null。
+ * 与 callModel/probeBackend 的存在性检查必须共用这一个函数，
+ * 否则探活路径和真实调用路径会再次分叉。
+ */
+function resolveDirectBin(backend) {
+  const bin = OPENCODE_DIRECT_BIN[backend];
+  if (!bin) return null;
+  return fs.existsSync(bin) ? bin : null;
+}
 
 // 直连失败时是否回落到 wrapper。默认不回落——
 // 回落等于静默退回那条已知截断的路径，重现"编造评分"的老问题。
@@ -138,9 +152,21 @@ function arlRolePrompt(role, backend) {
 }
 
 function probeBackend(backend, wrapperPath, workdir) {
-  // opencode 有直连路径，探活必须走同一条，否则探活结果与实际调用路径不一致。
-  const directBin = OPENCODE_DIRECT_BIN[backend];
-  if (directBin && fs.existsSync(directBin)) {
+  // 探活与真实调用必须走同一条路径，且共用同一个解析函数——
+  // 否则会出现"探活过、实际调用挂"或反向的假信号。
+  // 配置了直连但路径不存在时返回不可用 + 原因，不回落 wrapper 探活：
+  // wrapper 对单行短探活是正常的，探出来 available=true 是假阳性，
+  // 真实评审（多行长 prompt）才会踩截断。
+  const directBin = resolveDirectBin(backend);
+  if (OPENCODE_DIRECT_BIN[backend]) {
+    if (!directBin) {
+      return {
+        available: false,
+        error: '直连路径不存在: ' + OPENCODE_DIRECT_BIN[backend] +
+          '（可用环境变量 ARL_OPENCODE_BIN 覆盖）。不回落 wrapper 探活——短输入探不出截断，是假阳性。',
+        path: 'direct-stdin',
+      };
+    }
     try {
       const r = spawnDirectOpencode(directBin, '只回复 OK 两个字符，不要多余内容。', workdir, 60000);
       const out = (r.stdout || '');
@@ -427,11 +453,33 @@ function callModel(opts) {
   }
 
   let lastError = null;
+
+  // ⚠ 前置检查：配置了直连但路径不存在 → 快速失败，绝不静默回落 wrapper。
+  //
+  // 为什么不能回落：wrapper 会把多行中文 prompt 拼进命令行参数并逐字截断，
+  // opencode 只收到第一行却照常输出维度分——那份"看似正常的评审"正是
+  // 2026-10-08 花了三天才定位的"编造评分"失败模式。静默回落让它复发且无告警。
+  //
+  // 为什么探活探不出来：wrapper 对探活用的单行短 ASCII 是正常的，
+  // 只有长多行 prompt 才会暴露截断。所以这道检查必须在真实调用前做，
+  // 并给出可操作的修复信息（对齐输入超长护栏的做法）。
+  const directBin = resolveDirectBin(backend);
+  if (OPENCODE_DIRECT_BIN[backend] && !directBin) {
+    return {
+      ok: false,
+      error: 'opencode 直连路径不存在: ' + OPENCODE_DIRECT_BIN[backend] +
+        '。设置环境变量 ARL_OPENCODE_BIN 指向 opencode 可执行文件后重试；' +
+        '不要绕过此检查回落 wrapper——wrapper 会截断多行中文 prompt，产生编造的评审。',
+      configMissing: true,
+      backend,
+      role,
+    };
+  }
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       // opencode 走直连（stdin），其余后端仍走 wrapper。理由见 OPENCODE_DIRECT_BIN。
-      const directBin = OPENCODE_DIRECT_BIN[backend];
-      const useDirect = !!directBin && fs.existsSync(directBin);
+      const useDirect = !!directBin;
 
       const result = useDirect
         ? spawnDirectOpencode(directBin, fullPrompt, workdir, timeout)
@@ -978,5 +1026,6 @@ module.exports = {
   validateRevision, callReviser, applyEdits, backendInputLimit, BACKEND_INPUT_LIMIT,
   normalizeCritique, FIELD_ALIASES,
   callModel, callCritic, callProposer, callRebutter, resolveBackends,
+  resolveDirectBin, OPENCODE_DIRECT_BIN,
   SEVERITY_WHITELIST, DIMENSION_WHITELIST, DECISION_WHITELIST, EVIDENCE_WHITELIST
 };
