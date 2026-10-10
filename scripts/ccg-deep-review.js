@@ -540,9 +540,19 @@ function runDecisionLayer(sha, proposalFile) {
   const base = path.basename(proposalFile).replace(/\.[^.]+$/, "").toLowerCase();
   // 决策层可能还没有任何 commit，slug 不能依赖 sha
   const shortSha = sha ? sha.slice(0, 8) : "wip";
-  const slug = engine.validateSlug("ccg-plan-" + base)
-    ? "ccg-plan-" + base
-    : "ccg-plan-" + shortSha;
+  // ⚠ slug 必须带上 critic 后端名。
+  //
+  // 实测踩到（2026-10-10）：并行跑两个家族（同 cwd、同一方案文件）时，
+  // 两进程算出同一个 slug → 同一产物目录。opencode 19:17 写入 critique-v1
+  // （5 条/1 Critical → blocked），claude 19:19 用自己的 8 条/0 Critical 版本
+  // 覆盖同一文件——先完成方的判定静默消失，双家族的独立性在产物层被破坏，
+  // 且日志（5 条/1C）与落盘（8 条/0C）不一致时极易误判为"日志错了"。
+  //
+  // 隔离维度选 critic 而非 proposer：评审结论由 critic 产出，产物归属随 critic。
+  const slugBase = "ccg-plan-" + base + "-" + cfg.critic;
+  const slug = engine.validateSlug(slugBase)
+    ? slugBase
+    : "ccg-plan-" + shortSha + "-" + cfg.critic;
   const dir = path.join(REPO, ".adversarial", slug);
   fs.mkdirSync(dir, { recursive: true });
 
